@@ -1494,7 +1494,7 @@ int TB_probe_wdl(TB_Position *pos, int *success)
   bool legalCaps = bestCap > -3;
 
   if (bestEp > bestCap) {
-    if (bestEp > v) { // ep capture (possibly cursed losing) is best.
+    if (bestEp > v) { // ep capture (possibly blessed losing) is best.
       *success = 2;
       return bestEp;
     }
@@ -1538,7 +1538,7 @@ static int probe_dtm_win(TB_Position *pos, int *success);
 // at captures.
 static int probe_dtm_loss(TB_Position *pos, int *success)
 {
-  int v, best = -10001;
+  int v, best = 0;
   bool legalCaps = false, legalEpCaps = false;
 
   int num = TB_generate_captures(pos);
@@ -1546,7 +1546,7 @@ static int probe_dtm_loss(TB_Position *pos, int *success)
   for (int m = 0; m < num; m++) {
     if (!TB_do_move(pos, m))
       continue;
-    v = -probe_dtm_win(pos, success) + 1;
+    v = probe_dtm_win(pos, success);
     TB_undo_move(pos, m);
     if (TB_move_is_ep(pos, m))
       legalEpCaps = true;
@@ -1568,13 +1568,13 @@ static int probe_dtm_loss(TB_Position *pos, int *success)
   }
 
 no_stalemate:
-  v = -10000 + 2 * probe_dtm_table(pos, false, success);
+  v = probe_dtm_table(pos, false, success);
   return max(best, v);
 }
 
 static int probe_dtm_win(TB_Position *pos, int *success)
 {
-  int v, best = -10001;
+  int v, best = 10000;
 
   int num = TB_generate_captures(pos);
   num = TB_generate_quiets(pos, num);
@@ -1586,11 +1586,11 @@ static int probe_dtm_win(TB_Position *pos, int *success)
     if (   (TB_has_en_passant(pos) ? TB_probe_wdl(pos, success)
                                     : probe_ab(pos, -1, 0, success)) < 0
         && *success)
-      v = -probe_dtm_loss(pos, success) - 1;
-    else
-      v = -10001;
+    {
+      v = probe_dtm_loss(pos, success) + 1;
+      best = min(best, v);
+    }
     TB_undo_move(pos, m);
-    best = max(best, v);
     if (*success == 0) return 0;
   }
 
@@ -1599,13 +1599,13 @@ static int probe_dtm_win(TB_Position *pos, int *success)
 
 // Probe the DTM table for a non-drawn position.
 // 'won' must be true if the position is a win or cursed win and
-// false if the position is a loss or cursed loss.
-// The value returned is 10000 - (#ply to mate) if the position is
-// winning and -10000 + (#ply to mate) if the position is losing.
+// false if the position is a loss or blessed loss.
+// The value returned is the number of moves to mate. Positive if winning,
+// negative if losing.
 int TB_probe_dtm(TB_Position *pos, bool won, int *success)
 {
   *success = 1;
-  return won ? probe_dtm_win(pos, success) : probe_dtm_loss(pos, success);
+  return won ? probe_dtm_win(pos, success) : -probe_dtm_loss(pos, success);
 }
 
 static int WdlToDtz[] = { -1, -101, 0, 101, 1 };
@@ -1685,7 +1685,7 @@ int TB_probe_dtz(TB_Position *pos, int *success)
     best = INT32_MAX;
     // If wdl > 0, we have already generated quiet moves.
   } else {
-    // If (cursed) loss, the worst case is a losing capture or pawn move
+    // If (blessed) loss, the worst case is a losing capture or pawn move
     // as the "best" move, meaning dtz is -1 or -101.
     // In case of mate, this will cause -1 to be returned.
     best = WdlToDtz[wdl + 2];

@@ -87,7 +87,7 @@ int TB_probe_dtz(TB_Position *pos, int *success);
 
 // Probe the DTM table for a non-drawn position.
 // 'won' must be true if the position is a win or cursed win and
-// false if the position is a loss or cursed loss.
+// false if the position is a loss or blessed loss.
 // The value returned is 10000 - (#ply to mate) if the position is
 // winning and -10000 + (#ply to mate) if the position is losing.
 //

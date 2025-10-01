@@ -4,7 +4,6 @@
 */
 
 #include <getopt.h>
-#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -98,7 +97,7 @@ void print_pv_dtz(TB_Position *pos)
     if (TB_white_to_move(pos))
       sprintf(str, " %d.", 1 + (k + 1) / 2);
     else if (k == 0)
-      strcat(str, "1...");
+      strcpy(str, "1...");
     else
       strcpy(str, " ");
     if (uciMoves)
@@ -254,29 +253,29 @@ bool root_probe_dtm(TB_Position *pos)
     int s = rootMove[i].score;
     int wdl = s > 100 ? 2 : s < -100 ? -2 : 0;
     if (wdl == 0)
-      val[i] = s; // pure draw or cursed win or loss
+      val[i] = s; // pure draw or cursed win or blessed loss
     else {
       int m = rootMove[i].m;
       TB_do_move(pos, m); // We know it's legal
       int dtm = -TB_probe_dtm(pos, wdl < 0, &success);
       TB_undo_move(pos, m);
-      // Adjust score to our VALUE_MATE
-      val[i] = dtm > 0 ? dtm + (VALUE_MATE - 10000) - 1
-                       : dtm - (VALUE_MATE - 10000) + 1;
+      // Convert dtm into a mate score
+      val[i] = dtm > 0 ?  VALUE_MATE - (2 * dtm - 1)
+                       : -VALUE_MATE - 2 * dtm;
       if (success == 0)
         return false;
     }
+  }
 
-    // All DTM probes were successful. Now adjust TB scores and ranks.
-    for (int i = 0; i < numRootMoves; i++) {
-      rootMove[i].score = val[i];
+  // All DTM probes were successful. Now adjust TB scores and ranks.
+  for (int i = 0; i < numRootMoves; i++) {
+    rootMove[i].score = val[i];
 
-      // Let rank correspond to mate score, except for critical moves
-      // ranked 900, which we rank below all other mates for safety.
-      // By ranking mates above 1000 or below -1000, we let the search
-      // know it need not search those moves.
-      rootMove[i].rank = rootMove[i].rank == 900 ? 1001 : val[i];
-    }
+    // Let rank correspond to mate score, except for critical moves
+    // ranked 900, which we rank below all other mates for safety.
+    // By ranking mates above 1000 or below -1000, we let the search
+    // know it need not search those moves.
+    rootMove[i].rank = rootMove[i].rank == 900 ? 1001 : val[i];
   }
 
   return true;
@@ -311,7 +310,7 @@ static void score_to_meaning(int score, char *meaning)
   else if (score == 0)
     strcpy(meaning, "draw");
   else if (score > -VALUE_TB_WIN)
-    strcpy(meaning, "cursed loss (draw)");
+    strcpy(meaning, "blessed loss (draw)");
   else if (score == -VALUE_TB_WIN)
     strcpy(meaning, "TB loss");
   else
@@ -340,7 +339,7 @@ static void print_root_moves(TB_Position *pos)
 extern char *optarg;
 
 static char *wdlStr[] = {
-  "loss", "cursed loss", "draw", "cursed win", "win"
+  "loss", "blessed loss", "draw", "cursed win", "win"
 };
 
 int main(int argc, char *argv[])
@@ -397,7 +396,7 @@ int main(int argc, char *argv[])
     printf("DTZ probe failed.\n");
 
   if (TB_NumTables[TB_DTM] > 0) {
-    int dtm = TB_probe_dtm(pos, wdl, &successDtm);
+    int dtm = TB_probe_dtm(pos, wdl > 0, &successDtm);
     if (successDtm)
       printf("DTM = %d moves\n", dtm);
     else
