@@ -117,6 +117,75 @@ exit:
   printf("\n");
 }
 
+// Print a DTM-optimal line of moves leading to mate.
+void print_pv_dtm(TB_Position *pos)
+{
+  int success, k = 0;
+  char str[32];
+  char moveStr[16];
+  int pv[2000];
+
+  printf("\nDTM-optimal mating line:\n[FEN \"%s\"]\n", fen);
+  col = 0;
+  int winning = TB_probe_wdl(pos, &success) > 0;
+  if (success == 0) {
+    printf("*\n");
+    return;
+  }
+
+  int bestScore;
+  do {
+    int numCaps = TB_generate_captures(pos);
+    int numMoves = TB_generate_quiets(pos, numCaps);
+
+    int v, bestMove = 0;
+    bestScore = -10001;
+    for (int m = 0; m < numMoves; m++) {
+      if (!TB_do_move(pos, m))
+        continue;
+      // If the parent position is winning, we need to check that this is
+      // one of the winning moves, i.e. the position is now losing.
+      if (!winning || TB_probe_wdl(pos, &success) < 0) {
+        int dtm = success ? -TB_probe_dtm(pos, !winning, &success) : 0;
+        // Convert dtm to a "linear" score that allows for easy comparison.
+        v = dtm >= 0 ? 10000 - dtm : -10000 - dtm;
+        if (v > bestScore) {
+          bestScore = v;
+          bestMove = m;
+        }
+      }
+      TB_undo_move(pos, m);
+      if (!success) {
+        output(" *");
+        goto exit;
+      }
+    }
+    if (bestScore == -10001)
+      break;
+    if (TB_white_to_move(pos))
+      sprintf(str, " %d.", 1 + (k + 1) / 2);
+    else if (k == 0)
+      strcpy(str, "1...");
+    else
+      strcpy(str, " ");
+    if (uciMoves)
+      TBitf_move_to_string_uci(pos, bestMove, moveStr);
+    else
+      TBitf_move_to_string(pos, bestMove, moveStr);
+    strcat(str, moveStr);
+    output(str);
+    TB_do_move(pos, bestMove);
+    pv[k++] = bestMove;
+    winning = !winning;
+  } while (bestScore < 10000 && k < 2000);
+
+exit:
+  while (k > 0)
+    TB_undo_move(pos, pv[--k]);
+
+  printf("\n");
+}
+
 struct RootMove {
   int m;
   int rank;
@@ -405,6 +474,9 @@ int main(int argc, char *argv[])
 
   if (successDtz && wdl != 0)
     print_pv_dtz(pos);
+
+  if (successDtm && wdl != 0)
+    print_pv_dtm(pos);
 
   if (!rootProbe)
     goto exit;
