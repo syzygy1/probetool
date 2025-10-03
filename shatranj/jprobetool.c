@@ -339,7 +339,7 @@ bool root_probe_dtm(TB_Position *pos)
     int s = rootMove[i].score;
     int wdl = s > 100 ? 2 : s < -100 ? -2 : 0;
     if (wdl == 0)
-      val[i] = s; // pure draw or cursed win or loss
+      val[i] = s; // pure draw or cursed win or blessed loss
     else {
       int m = rootMove[i].m;
       TB_do_move(pos, m); // We know it's legal
@@ -396,7 +396,7 @@ static void score_to_meaning(int score, char *meaning)
   else if (score == 0)
     strcpy(meaning, "draw");
   else if (score > -VALUE_TB_WIN)
-    strcpy(meaning, "cursed loss (draw)");
+    strcpy(meaning, "blessed loss (draw)");
   else if (score == -VALUE_TB_WIN)
     strcpy(meaning, "TB loss");
   else
@@ -425,7 +425,7 @@ static void print_root_moves(TB_Position *pos)
 extern char *optarg;
 
 static char *wdlStr[] = {
-  "loss", "cursed loss", "draw", "cursed win", "win"
+  "loss", "blessed loss", "draw", "cursed win", "win"
 };
 
 int main(int argc, char *argv[])

@@ -13,8 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <sys/stat.h>
+#endif
 
 #include "jtbprobe.h"
 #include "jtbinterface.h"
@@ -396,8 +398,8 @@ static void detect_tb(char *str)
     add_to_hash(be, key2);
 }
 
-#define PIECE(x) ((struct PieceEntry *)(x))
-#define PAWN(x) ((struct PawnEntry *)(x))
+#define PCE_E(x) ((struct PieceEntry *)(x))
+#define PWN_E(x) ((struct PawnEntry *)(x))
 
 INLINE int num_tables(struct BaseEntry *be, const int type)
 {
@@ -407,8 +409,8 @@ INLINE int num_tables(struct BaseEntry *be, const int type)
 INLINE struct EncInfo *first_ei(struct BaseEntry *be, const int type)
 {
   return  be->hasPawns
-        ? &PAWN(be)->ei[type == WDL ? 0 : type == DTM ? 8 : 20]
-        : &PIECE(be)->ei[type == WDL ? 0 : type == DTM ? 2 : 4];
+        ? &PWN_E(be)->ei[type == WDL ? 0 : type == DTM ? 8 : 20]
+        : &PCE_E(be)->ei[type == WDL ? 0 : type == DTM ? 2 : 4];
 }
 
 static void free_tb_entry(struct BaseEntry *be)
@@ -1077,9 +1079,9 @@ static NOINLINE bool init_table(struct BaseEntry *be, const char *str,
     ei[t].precomp = setup_pairs(&data, tb_size[t][0], size[t][0], &flags, type);
     if (type == DTZ) {
       if (!be->hasPawns)
-        PIECE(be)->dtzFlags = flags;
+        PCE_E(be)->dtzFlags = flags;
       else
-        PAWN(be)->dtzFlags[t] = flags;
+        PWN_E(be)->dtzFlags[t] = flags;
     }
     if (split)
       ei[num + t].precomp = setup_pairs(&data, tb_size[t][1], size[t][1], &flags, type);
@@ -1089,9 +1091,9 @@ static NOINLINE bool init_table(struct BaseEntry *be, const char *str,
 
   if (type == DTM && !be->dtmLossOnly) {
     uint16_t *map = (uint16_t *)data;
-    *(be->hasPawns ? &PAWN(be)->dtmMap : &PIECE(be)->dtmMap) = map;
-    uint16_t (*mapIdx)[2][2] = be->hasPawns ? &PAWN(be)->dtmMapIdx[0]
-                                            : &PIECE(be)->dtmMapIdx;
+    *(be->hasPawns ? &PWN_E(be)->dtmMap : &PCE_E(be)->dtmMap) = map;
+    uint16_t (*mapIdx)[2][2] = be->hasPawns ? &PWN_E(be)->dtmMapIdx[0]
+                                            : &PCE_E(be)->dtmMapIdx;
     for (int t = 0; t < num; t++) {
       for (int i = 0; i < 2; i++) {
         mapIdx[t][0][i] = (uint16_t *)data + 1 - map;
@@ -1108,11 +1110,11 @@ static NOINLINE bool init_table(struct BaseEntry *be, const char *str,
 
   if (type == DTZ) {
     const void *map = data;
-    *(be->hasPawns ? &PAWN(be)->dtzMap : &PIECE(be)->dtzMap) = map;
-    uint16_t (*mapIdx)[4] = be->hasPawns ? &PAWN(be)->dtzMapIdx[0]
-                                         : &PIECE(be)->dtzMapIdx;
-    uint8_t *flags = be->hasPawns ? &PAWN(be)->dtzFlags[0]
-                                  : &PIECE(be)->dtzFlags;
+    *(be->hasPawns ? &PWN_E(be)->dtzMap : &PCE_E(be)->dtzMap) = map;
+    uint16_t (*mapIdx)[4] = be->hasPawns ? &PWN_E(be)->dtzMapIdx[0]
+                                         : &PCE_E(be)->dtzMapIdx;
+    uint8_t *flags = be->hasPawns ? &PWN_E(be)->dtzFlags[0]
+                                  : &PCE_E(be)->dtzFlags;
     for (int t = 0; t < num; t++) {
       if (flags[t] & 2) {
         if (!(flags[t] & 16)) {
@@ -1167,7 +1169,7 @@ static NOINLINE bool init_table(struct BaseEntry *be, const char *str,
       count[i] = 0;
     for (int i = 0; i < be->num; i++)
       count[ei[0].pieces[i]]++;
-    PAWN(be)->dtmSwitched =
+    PWN_E(be)->dtmSwitched =
         TB_material_key_from_counts(count, count + 8) != be->key;
   }
 
@@ -1292,7 +1294,7 @@ INLINE int probe_table(TB_Position *pos, int s, int *success, const int type)
   if (!be->symmetric) {
     flip = key != be->key;
     bside = TB_white_to_move(pos) == flip;
-    if (type == DTM && be->hasPawns && PAWN(be)->dtmSwitched) {
+    if (type == DTM && be->hasPawns && PWN_E(be)->dtmSwitched) {
       flip = !flip;
       bside = !bside;
     }
@@ -1309,7 +1311,7 @@ INLINE int probe_table(TB_Position *pos, int s, int *success, const int type)
 
   if (!be->hasPawns) {
     if (type == DTZ) {
-      flags = PIECE(be)->dtzFlags;
+      flags = PCE_E(be)->dtzFlags;
       if ((flags & 1) != bside && !be->symmetric) {
         *success = -1;
         return 0;
@@ -1322,7 +1324,7 @@ INLINE int probe_table(TB_Position *pos, int s, int *success, const int type)
     TB_list_squares(pos, ei->pieces, flip, p);
     t = leading_pawn(p, be, type != DTM ? FILE_ENC : RANK_ENC);
     if (type == DTZ) {
-      flags = PAWN(be)->dtzFlags[t];
+      flags = PWN_E(be)->dtzFlags[t];
       if ((flags & 1) != bside && !be->symmetric) {
         *success = -1;
         return 0;
@@ -1344,19 +1346,19 @@ INLINE int probe_table(TB_Position *pos, int s, int *success, const int type)
   if (type == DTM) {
     if (!be->dtmLossOnly)
       v =  from_le_u16(be->hasPawns
-         ? PAWN(be)->dtmMap[PAWN(be)->dtmMapIdx[t][bside][s] + v]
-         : PIECE(be)->dtmMap[PIECE(be)->dtmMapIdx[bside][s] + v]);
+         ? PWN_E(be)->dtmMap[PWN_E(be)->dtmMapIdx[t][bside][s] + v]
+         : PCE_E(be)->dtmMap[PCE_E(be)->dtmMapIdx[bside][s] + v]);
   } else {
     if (flags & 2) {
       int m = WdlToMap[s + 2];
       if (!(flags & 16))
         v =  be->hasPawns
-           ? ((uint8_t *)PAWN(be)->dtzMap)[PAWN(be)->dtzMapIdx[t][m] + v]
-           : ((uint8_t *)PIECE(be)->dtzMap)[PIECE(be)->dtzMapIdx[m] + v];
+           ? ((uint8_t *)PWN_E(be)->dtzMap)[PWN_E(be)->dtzMapIdx[t][m] + v]
+           : ((uint8_t *)PCE_E(be)->dtzMap)[PCE_E(be)->dtzMapIdx[m] + v];
       else
         v =  from_le_u16(be->hasPawns
-           ? ((uint16_t *)PAWN(be)->dtzMap)[PAWN(be)->dtzMapIdx[t][m] + v]
-           : ((uint16_t *)PIECE(be)->dtzMap)[PIECE(be)->dtzMapIdx[m] + v]);
+           ? ((uint16_t *)PWN_E(be)->dtzMap)[PWN_E(be)->dtzMapIdx[t][m] + v]
+           : ((uint16_t *)PCE_E(be)->dtzMap)[PCE_E(be)->dtzMapIdx[m] + v]);
     }
     if (!(flags & PAFlags[s + 2]) || (s & 1))
       v *= 2;
@@ -1698,7 +1700,7 @@ int TB_probe_dtz(TB_Position *pos, int *success)
     best = INT32_MAX;
     // If wdl > 0, we have already generated quiet moves.
   } else {
-    // If (cursed) loss, the worst case is a losing capture or pawn move
+    // If (blessed) loss, the worst case is a losing capture or pawn move
     // as the "best" move, meaning dtz is -1 or -101.
     // In case of mate, this will cause -1 to be returned.
     best = WdlToDtz[wdl + 2];

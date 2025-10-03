@@ -1,4 +1,5 @@
 *.o
 *.swp
+*.exe
 probetool
 jprobetool

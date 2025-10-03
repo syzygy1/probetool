@@ -79,25 +79,30 @@ struct Magic {
   uint64_t magic;
 };
 
-static Bitboard attacksTable[88772];
-static struct Magic bishopMagic[64];
-static struct Magic rookMagic[64];
+static Bitboard AttacksTable[88772];
+static struct Magic BishopMagic[64];
+static struct Magic RookMagic[64];
 
-static Bitboard bit[64];
+static Bitboard Bit[64];
 
-static Bitboard pawnAttacks[2][64];
-static Bitboard knightAttacks[64];
-static Bitboard kingAttacks[64];
+static Bitboard PawnAttacks[2][64];
+static Bitboard KnightAttacks[64];
+static Bitboard KingAttacks[64];
+
+INLINE Bitboard bit(int sq)
+{
+  return Bit[sq];
+}
 
 INLINE Bitboard bishop_attacks(int sq, Bitboard occ)
 {
-  struct Magic *mag = &bishopMagic[sq];
+  struct Magic *mag = &BishopMagic[sq];
   return mag->data[((occ & mag->mask) * mag->magic) >> (64-9)];
 }
 
 INLINE Bitboard rook_attacks(int sq, Bitboard occ)
 {
-  struct Magic *mag = &rookMagic[sq];
+  struct Magic *mag = &RookMagic[sq];
   return mag->data[((occ & mag->mask) * mag->magic) >> (64-12)];
 }
 
@@ -108,17 +113,17 @@ INLINE Bitboard queen_attacks(int sq, Bitboard occ)
 
 INLINE Bitboard knight_attacks(int sq)
 {
-  return knightAttacks[sq];
+  return KnightAttacks[sq];
 }
 
 INLINE Bitboard king_attacks(int sq)
 {
-  return kingAttacks[sq];
+  return KingAttacks[sq];
 }
 
 INLINE Bitboard pawn_attacks(int c, int sq)
 {
-  return pawnAttacks[c][sq];
+  return PawnAttacks[c][sq];
 }
 
 struct MagicInit {
@@ -129,7 +134,7 @@ struct MagicInit {
 // Fixed-shift magics found by Volker Annuss
 // from: http://talkchess.com/forum/viewtopic.php?p=727500#727500
 
-static struct MagicInit bishopInit[64] = {
+static struct MagicInit BishopInit[64] = {
   { 0x007fbfbfbfbfbfffu,   5378 },
   { 0x0000a060401007fcu,   4093 },
   { 0x0001004008020000u,   4314 },
@@ -196,7 +201,7 @@ static struct MagicInit bishopInit[64] = {
   { 0x007fff9fdf7ff813u,  16076 } 
 };
 
-static struct MagicInit rookInit[64] = {
+static struct MagicInit RookInit[64] = {
   { 0x00280077ffebfffeu,  26304 },
   { 0x2004010201097fffu,  35520 },
   { 0x0010020010053fffu,  38592 },
@@ -263,25 +268,25 @@ static struct MagicInit rookInit[64] = {
   { 0x0001ffff9dffa333u,  14826 } 
 };
 
-static signed char pawnDelta[2][2][2] = {
+static signed char PawnDelta[2][2][2] = {
   { {  7,  15 }, {  9,  17 } },
   { { -9, -17 }, { -7, -15 } }
 };
 
-static signed char knightDelta[8][2] = {
+static signed char KnightDelta[8][2] = {
   { -17, -33 }, { -15, -31 }, { -10, -18 }, { -6, -14 },
   {   6,  14 }, {  10,  18 }, {  15,  31 }, { 17,  33 }
 };
 
-static signed char bishopDelta[4][2] = {
+static signed char BishopDelta[4][2] = {
   { -9, -17 }, { -7, -15 }, { 7, 15 }, { 9, 17 }
 };
 
-static signed char rookDelta[4][2] = {
+static signed char RookDelta[4][2] = {
   { -8, -16 }, { -1, -1 }, { 1, 1 }, { 8, 16 }
 };
 
-static signed char kingDelta[8][2] = {
+static signed char KingDelta[8][2] = {
   { -9, -17 }, { -8, -16 }, { -7, -15 }, { -1, -1 },
   {  1,   1 }, {  7,  15 }, {  8,  16 }, {  9, 17 }
 };
@@ -298,7 +303,7 @@ static Bitboard calc_attacks(int sq, signed char delta[][2], int num)
 
   for (int d = 0; d < num; d++)
     if (valid(sq, delta[d]))
-      bb |= bit[sq + delta[d][0]];
+      bb |= bit(sq + delta[d][0]);
 
   return bb;
 }
@@ -308,14 +313,14 @@ static void init_magics(struct MagicInit *magicInit, struct Magic *magic,
 {
   for (int sq = 0; sq < 64; sq++) {
     magic[sq].magic = magicInit[sq].magic;
-    magic[sq].data = &attacksTable[magicInit[sq].index];
+    magic[sq].data = &AttacksTable[magicInit[sq].index];
 
     // Calculate mask
     Bitboard mask = 0;
     for (int i = 0; i < 4; i++) {
       if (!valid(sq, delta[i])) continue;
       for (int s = sq + delta[i][0]; valid(s, delta[i]); s += delta[i][0])
-        mask |= bit[s]; 
+        mask |= bit(s);
     }
     magic[sq].mask = mask;
 
@@ -325,8 +330,8 @@ static void init_magics(struct MagicInit *magicInit, struct Magic *magic,
       Bitboard attacks = 0;
       for (int j = 0; j < 4; j++)
         for (int s = sq; valid(s, delta[j]); s += delta[j][0]) {
-          attacks |= bit[s + delta[j][0]];
-          if (b & bit[s + delta[j][0]]) break;
+          attacks |= bit(s + delta[j][0]);
+          if (b & bit(s + delta[j][0])) break;
         }
       magic[sq].data[(b * magic[sq].magic) >> shift] = attacks;
       b = (b - mask) & mask;
@@ -338,22 +343,22 @@ static void init_magics(struct MagicInit *magicInit, struct Magic *magic,
 void TBitf_init(void)
 {
   for (int sq = 0; sq < 64; sq++)
-    bit[sq] = 1ULL << sq;
+    Bit[sq] = 1ULL << sq;
 
   for (int sq = 0; sq < 64; sq++) {
-    pawnAttacks[WHITE][sq] = calc_attacks(sq, pawnDelta[WHITE], 2);
-    pawnAttacks[BLACK][sq] = calc_attacks(sq, pawnDelta[BLACK], 2);
-    knightAttacks[sq]      = calc_attacks(sq, knightDelta,      8);
-    kingAttacks[sq]        = calc_attacks(sq, kingDelta,        8);
+    PawnAttacks[WHITE][sq] = calc_attacks(sq, PawnDelta[WHITE], 2);
+    PawnAttacks[BLACK][sq] = calc_attacks(sq, PawnDelta[BLACK], 2);
+    KnightAttacks[sq]      = calc_attacks(sq, KnightDelta,      8);
+    KingAttacks[sq]        = calc_attacks(sq, KingDelta,        8);
   }
 
-  init_magics(bishopInit, bishopMagic, bishopDelta, 64 - 9);
-  init_magics(rookInit,   rookMagic,   rookDelta,   64 - 12);
+  init_magics(BishopInit, BishopMagic, BishopDelta, 64 - 9);
+  init_magics(RookInit,   RookMagic,   RookDelta,   64 - 12);
 }
 
 INLINE Bitboard piece_attacks(int pt, int sq, Bitboard occ)
 {
-  switch (pt) {
+  switch (pt & 7) {
   case KNIGHT:
     return knight_attacks(sq);
   case BISHOP:
@@ -373,7 +378,7 @@ INLINE Bitboard attacks(int pt, int sq, Bitboard occ)
   if ((pt & 7) == PAWN)
     return pawn_attacks(pt >> 3, sq);
   else
-    return piece_attacks(pt & 7, sq, occ);
+    return piece_attacks(pt, sq, occ);
 }
 
 /* Board and move representation */
@@ -595,7 +600,6 @@ INLINE bool rank18(int sq)
 int TB_generate_captures(TB_Position *pos)
 {
   int m = pos->state[pos->idx].firstMove;
-  Bitboard b;
 
   if (m + 150 >= pos->maxMoves) {
     pos->maxMoves += 500;
@@ -605,7 +609,7 @@ int TB_generate_captures(TB_Position *pos)
   // generate ep captures
   if (pos->state[pos->idx].epPiece >= 0) {
     int epSquare = pos->sq[pos->state[pos->idx].epPiece] ^ 8;
-    b = pawn_attacks(pos->stm ^ 1, epSquare) & pos->occ;
+    Bitboard b = pawn_attacks(pos->stm ^ 1, epSquare) & pos->occ;
     while (b) {
       int sq = pop_lsb(&b);
       int i = piece_idx(pos, sq);
@@ -619,7 +623,7 @@ int TB_generate_captures(TB_Position *pos)
     if ((pos->pt[i] >> 3) != pos->stm)
       continue;
     if ((pos->pt[i] & 7) == PAWN) {
-      b = pawn_attacks(pos->pt[i] >> 3, pos->sq[i]) & pos->occ;
+      Bitboard b = pawn_attacks(pos->pt[i] >> 3, pos->sq[i]) & pos->occ;
       while (b) {
         int sq = pop_lsb(&b);
         int j = piece_idx(pos, sq);
@@ -636,7 +640,7 @@ int TB_generate_captures(TB_Position *pos)
       }
     }
     else {
-      b = piece_attacks(pos->pt[i] & 7, pos->sq[i], pos->occ) & pos->occ;
+      Bitboard b = piece_attacks(pos->pt[i], pos->sq[i], pos->occ) & pos->occ;
       while (b) {
         int sq = pop_lsb(&b);
         int j = piece_idx(pos, sq);
@@ -666,10 +670,10 @@ int TB_generate_quiets(TB_Position *pos, int start)
     if ((pos->pt[i] & 7) == PAWN) { // pawn moves
       int sq = pos->sq[i];
       int fwd = pos->stm == WHITE ? 8 : -8;
-      if (!(bit[sq + fwd] & pos->occ)) {
+      if (!(bit(sq + fwd) & pos->occ)) {
         if (!rank18(sq + fwd)) {
           pos->move[m++] = make_quiet(i, sq + fwd);
-          if (rank18(sq - fwd) && (!(bit[sq ^ 16] & pos->occ)))
+          if (rank18(sq - fwd) && (!(bit(sq ^ 16) & pos->occ)))
             pos->move[m++] = make_quiet(i, sq ^ 16);
         } else {
           pos->move[m++] = make_prom(i, sq + fwd, QUEEN);
@@ -679,7 +683,7 @@ int TB_generate_quiets(TB_Position *pos, int start)
         }
       }
     } else { // non-pawn moves
-      b = piece_attacks(pos->pt[i] & 7, pos->sq[i], pos->occ) & ~pos->occ;
+      b = piece_attacks(pos->pt[i], pos->sq[i], pos->occ) & ~pos->occ;
       while (b) {
         int sq = pop_lsb(&b);
         pos->move[m++] = make_quiet(i, sq);
@@ -693,7 +697,7 @@ int TB_generate_quiets(TB_Position *pos, int start)
 
 INLINE bool king_attacked(TB_Position *pos, int stm)
 {
-  Bitboard b = bit[pos->sq[stm]]; // square of king
+  Bitboard b = bit(pos->sq[stm]); // square of king
   for (int i = 0; i < pos->num; i++)
     if (   (pos->pt[i] >> 3) == (stm ^ 1)
         && (attacks(pos->pt[i], pos->sq[i], pos->occ) & b))
@@ -723,13 +727,13 @@ bool TB_do_move(TB_Position *pos, int m)
   int i = move & 7, j = move >> 8;
   pos->state[pos->idx].fromSquare = pos->sq[i];
   pos->state[++pos->idx].epPiece = -1;
-  pos->occ ^= bit[pos->sq[i]];
+  pos->occ ^= bit(pos->sq[i]);
   if (move & PROM_FLAG)
     pos->pt[i] += KNIGHT - PAWN + ((move & PROM_MASK) >> 6);
   if (move & CAPT_FLAG) {
     pos->sq[i] = pos->sq[j];
     if (move & EP_FLAG) {
-      pos->occ ^= bit[pos->sq[i]] ^ bit[pos->sq[i] ^ 8];
+      pos->occ ^= bit(pos->sq[i]) ^ bit(pos->sq[i] ^ 8);
       pos->sq[i] ^= 8;
     }
     pos->pt[pos->num--] = pos->pt[j];
@@ -739,7 +743,7 @@ bool TB_do_move(TB_Position *pos, int m)
     if ((pos->pt[i] & 7) == PAWN && (pos->sq[i] ^ j) == 16)
       pos->state[pos->idx].epPiece = i;
     pos->sq[i] = j;
-    pos->occ ^= bit[j];
+    pos->occ ^= bit(j);
   }
   pos->stm ^= 1;
 
@@ -762,16 +766,16 @@ void TB_undo_move(TB_Position *pos, int m)
     pos->pt[j] = pos->pt[++pos->num];
     pos->sq[j] = pos->sq[i];
     if (move & EP_FLAG) {
-      pos->occ ^= bit[pos->sq[j]] ^ bit[pos->sq[j] ^ 8];
+      pos->occ ^= bit(pos->sq[j]) ^ bit(pos->sq[j] ^ 8);
       pos->sq[j] ^= 8;
     }
   } else {
-    pos->occ ^= bit[j];
+    pos->occ ^= bit(j);
   }
   if (move & PROM_FLAG)
     pos->pt[i] = (pos->pt[i] & 8) | PAWN;
   pos->sq[i] = pos->state[pos->idx].fromSquare;
-  pos->occ ^= bit[pos->sq[i]];
+  pos->occ ^= bit(pos->sq[i]);
   pos->stm ^= 1;
 }
 
@@ -869,7 +873,7 @@ void TBitf_set_from_fen(TB_Position *pos, const char *fen, int *cnt50)
 finish:
   pos->occ = 0;
   for (int i = 0; i < pos->num; i++)
-    pos->occ |= bit[pos->sq[i]];
+    pos->occ |= bit(pos->sq[i]);
 
   if (!opp_king_attacked(pos))
     return;

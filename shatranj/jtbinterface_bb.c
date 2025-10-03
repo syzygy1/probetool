@@ -62,46 +62,51 @@ struct Magic {
   uint64_t magic;
 };
 
-static Bitboard attacksTable[88772];
-static struct Magic rookMagic[64];
+static Bitboard AttacksTable[88772];
+static struct Magic RookMagic[64];
 
-static Bitboard bit[64];
+static Bitboard Bit[64];
 
-static Bitboard pawnAttacks[2][64];
-static Bitboard knightAttacks[64];
-static Bitboard bishopAttacks[64];
-static Bitboard queenAttacks[64];
-static Bitboard kingAttacks[64];
+static Bitboard PawnAttacks[2][64];
+static Bitboard KnightAttacks[64];
+static Bitboard BishopAttacks[64];
+static Bitboard QueenAttacks[64];
+static Bitboard KingAttacks[64];
+
+INLINE Bitboard bit(int sq)
+{
+  return Bit[sq];
+}
 
 INLINE Bitboard rook_attacks(int sq, Bitboard occ)
 {
-  struct Magic *mag = &rookMagic[sq];
+  struct Magic *mag = &RookMagic[sq];
   return mag->data[((occ & mag->mask) * mag->magic) >> (64-12)];
 }
 
 INLINE Bitboard bishop_attacks(int sq)
 {
-  return bishopAttacks[sq];
+  return BishopAttacks[sq];
 }
 
 INLINE Bitboard queen_attacks(int sq)
 {
-  return queenAttacks[sq];
+  return QueenAttacks[sq];
 }
 
 INLINE Bitboard knight_attacks(int sq)
 {
-  return knightAttacks[sq];
+  return KnightAttacks[sq];
 }
 
 INLINE Bitboard king_attacks(int sq)
 {
-  return kingAttacks[sq];
+  return KingAttacks[sq];
 }
 
 INLINE Bitboard pawn_attacks(int c, int sq)
 {
-  return pawnAttacks[c][sq];
+  return PawnAttacks[c][sq];
 }
 
 struct MagicInit {
@@ -112,7 +117,7 @@ struct MagicInit {
 // Fixed-shift magics found by Volker Annuss
 // from: http://talkchess.com/forum/viewtopic.php?p=727500#727500
 
-static struct MagicInit rookInit[64] = {
+static struct MagicInit RookInit[64] = {
   { 0x00280077ffebfffeu,  26304 },
   { 0x2004010201097fffu,  35520 },
   { 0x0010020010053fffu,  38592 },
@@ -179,29 +184,29 @@ static struct MagicInit rookInit[64] = {
   { 0x0001ffff9dffa333u,  14826 } 
 };
 
-static signed char pawnDelta[2][2][2] = {
+static signed char PawnDelta[2][2][2] = {
   { {  7,  15 }, {  9,  17 } },
   { { -9, -17 }, { -7, -15 } }
 };
 
-static signed char knightDelta[8][2] = {
+static signed char KnightDelta[8][2] = {
   { -17, -33 }, { -15, -31 }, { -10, -18 }, { -6, -14 },
   {   6,  14 }, {  10,  18 }, {  15,  31 }, { 17,  33 }
 };
 
-static signed char bishopDelta[4][2] = {
+static signed char BishopDelta[4][2] = {
   { -18, -34 }, { -14, -30 }, { 14, 30 }, { 18, 34 }
 };
 
-static signed char rookDelta[4][2] = {
+static signed char RookDelta[4][2] = {
   { -8, -16 }, { -1, -1 }, { 1, 1 }, { 8, 16 }
 };
 
-static signed char queenDelta[4][2] = {
+static signed char QueenDelta[4][2] = {
   { -9, -17 }, { -7, -15 }, { 7, 15 }, { 9, 17 }
 };
 
-static signed char kingDelta[8][2] = {
+static signed char KingDelta[8][2] = {
   { -9, -17 }, { -8, -16 }, { -7, -15 }, { -1, -1 },
   {  1,   1 }, {  7,  15 }, {  8,  16 }, {  9, 17 }
 };
@@ -218,7 +223,7 @@ static Bitboard calc_attacks(int sq, signed char delta[][2], int num)
 
   for (int d = 0; d < num; d++)
     if (valid(sq, delta[d]))
-      bb |= bit[sq + delta[d][0]];
+      bb |= bit(sq + delta[d][0]);
 
   return bb;
 }
@@ -228,14 +233,14 @@ static void init_magics(struct MagicInit *magicInit, struct Magic *magic,
 {
   for (int sq = 0; sq < 64; sq++) {
     magic[sq].magic = magicInit[sq].magic;
-    magic[sq].data = &attacksTable[magicInit[sq].index];
+    magic[sq].data = &AttacksTable[magicInit[sq].index];
 
     // Calculate mask
     Bitboard mask = 0;
     for (int i = 0; i < 4; i++) {
       if (!valid(sq, delta[i])) continue;
       for (int s = sq + delta[i][0]; valid(s, delta[i]); s += delta[i][0])
-        mask |= bit[s]; 
+        mask |= bit(s);
     }
     magic[sq].mask = mask;
 
@@ -245,8 +250,8 @@ static void init_magics(struct MagicInit *magicInit, struct Magic *magic,
       Bitboard attacks = 0;
       for (int j = 0; j < 4; j++)
         for (int s = sq; valid(s, delta[j]); s += delta[j][0]) {
-          attacks |= bit[s + delta[j][0]];
-          if (b & bit[s + delta[j][0]]) break;
+          attacks |= bit(s + delta[j][0]);
+          if (b & bit(s + delta[j][0])) break;
         }
       magic[sq].data[(b * magic[sq].magic) >> shift] = attacks;
       b = (b - mask) & mask;
@@ -257,23 +262,23 @@ static void init_magics(struct MagicInit *magicInit, struct Magic *magic,
 void TBitf_init(void)
 {
   for (int sq = 0; sq < 64; sq++)
-    bit[sq] = 1ULL << sq;
+    Bit[sq] = 1ULL << sq;
 
   for (int sq = 0; sq < 64; sq++) {
-    pawnAttacks[WHITE][sq] = calc_attacks(sq, pawnDelta[WHITE], 2);
-    pawnAttacks[BLACK][sq] = calc_attacks(sq, pawnDelta[BLACK], 2);
-    knightAttacks[sq]      = calc_attacks(sq, knightDelta,      8);
-    bishopAttacks[sq]      = calc_attacks(sq, bishopDelta,      4);
-    queenAttacks[sq]       = calc_attacks(sq, queenDelta,       4);
-    kingAttacks[sq]        = calc_attacks(sq, kingDelta,        8);
+    PawnAttacks[WHITE][sq] = calc_attacks(sq, PawnDelta[WHITE], 2);
+    PawnAttacks[BLACK][sq] = calc_attacks(sq, PawnDelta[BLACK], 2);
+    KnightAttacks[sq]      = calc_attacks(sq, KnightDelta,      8);
+    BishopAttacks[sq]      = calc_attacks(sq, BishopDelta,      4);
+    QueenAttacks[sq]       = calc_attacks(sq, QueenDelta,       4);
+    KingAttacks[sq]        = calc_attacks(sq, KingDelta,        8);
   }
 
-  init_magics(rookInit,   rookMagic,   rookDelta,   64 - 12);
+  init_magics(RookInit, RookMagic, RookDelta, 64 - 12);
 }
 
 INLINE Bitboard piece_attacks(int pt, int sq, Bitboard occ)
 {
-  switch (pt) {
+  switch (pt & 7) {
   case KNIGHT:
     return knight_attacks(sq);
   case BISHOP:
@@ -293,7 +298,7 @@ INLINE Bitboard attacks(int pt, int sq, Bitboard occ)
   if ((pt & 7) == PAWN)
     return pawn_attacks(pt >> 3, sq);
   else
-    return piece_attacks(pt & 7, sq, occ);
+    return piece_attacks(pt, sq, occ);
 }
 
 // Board and move representation
@@ -365,9 +370,9 @@ void TBitf_free_position(TB_Position *pos)
   free(pos);
 }
 
-static const char pieceChar[] = " PNBRQK  pnbrqk";
+static const char PieceChar[] = " PNBRQK  pnbrqk";
 
-static const uint64_t matKey[] = {
+static const uint64_t MatKey[] = {
   0, 0xd8c54b6242cc4658, 0xb84cd5fd6adf1a60, 0x0c8fa4e03da65e01,
   0xa16591be7916b4ac, 0x6e4682f9525cc4c4, 0, 0,
   0, 0x60adc383afac9d1b, 0x97bbdd24afa0b2d1, 0x298cefb2f9bfac89,
@@ -380,7 +385,7 @@ uint64_t TB_material_key(TB_Position *pos)
 
   // We can skip the two kings
   for (int i = 2; i < pos->num; i++)
-    key += matKey[pos->pt[i]];
+    key += MatKey[pos->pt[i]];
 
   return key;
 }
@@ -390,8 +395,8 @@ uint64_t TB_material_key_from_counts(int whiteCounts[8], int blackCounts[8])
   uint64_t key = 0;
 
   for (int i = PAWN; i <= QUEEN; i++)
-    key +=  whiteCounts[i] * matKey[i]
-          + blackCounts[i] * matKey[i + 8];
+    key +=  whiteCounts[i] * MatKey[i]
+          + blackCounts[i] * MatKey[i + 8];
 
   return key;
 }
@@ -408,11 +413,11 @@ void TB_material_string(TB_Position *pos, char str[16])
   int j = 0;
   for (int i = KING; i >= PAWN; i--)
     while (cnt[i]--)
-      str[j++] = pieceChar[i];
+      str[j++] = PieceChar[i];
   str[j++] = 'v';
   for (int i = KING; i >= PAWN; i--)
     while (cnt[8 + i]--)
-      str[j++] = pieceChar[i];
+      str[j++] = PieceChar[i];
   str[j] = 0;
 }
 
@@ -439,7 +444,7 @@ bool TB_bare_king(TB_Position *pos, int *v)
   // Still a draw if the bare king can capture the opponent's last piece.
   *v = pos->num == 3 && (   king_attacks(pos->sq[pos->stm])
                          & ~king_attacks(pos->sq[pos->stm ^ 1])
-                         &  bit[pos->sq[2]]) ? 0 : -2;
+                         &  bit(pos->sq[2])) ? 0 : -2;
 
   return true;
 }
@@ -540,7 +545,7 @@ int TB_generate_quiets(TB_Position *pos, int start)
     if ((pos->pt[i] & 7) == PAWN) { // pawn moves
       int sq = pos->sq[i];
       int fwd = pos->stm == WHITE ? 8 : -8;
-      if (!(bit[sq + fwd] & pos->occ)) {
+      if (!(bit(sq + fwd) & pos->occ)) {
         if (!rank18(sq + fwd))
           pos->move[m++] = make_quiet(i, sq + fwd);
         else
@@ -561,7 +566,7 @@ int TB_generate_quiets(TB_Position *pos, int start)
 
 INLINE bool king_attacked(TB_Position *pos, int stm)
 {
-  Bitboard b = bit[pos->sq[stm]]; // square of king
+  Bitboard b = bit(pos->sq[stm]); // square of king
   for (int i = 0; i < pos->num; i++)
     if (   (pos->pt[i] >> 3) == (stm ^ 1)
         && (attacks(pos->pt[i], pos->sq[i], pos->occ) & b))
@@ -590,7 +595,7 @@ bool TB_do_move(TB_Position *pos, int m)
 
   int i = move & 7, j = move >> 8;
   pos->state[pos->idx++].fromSquare = pos->sq[i];
-  pos->occ ^= bit[pos->sq[i]];
+  pos->occ ^= bit(pos->sq[i]);
   if (move & PROM_FLAG)
     pos->pt[i] += QUEEN - PAWN;
   if (move & CAPT_FLAG) {
@@ -601,7 +606,7 @@ bool TB_do_move(TB_Position *pos, int m)
     pos->pt[j] = pos->pt[pos->num];
   } else {
     pos->sq[i] = j;
-    pos->occ ^= bit[j];
+    pos->occ ^= bit(j);
   }
   pos->stm ^= 1;
 
@@ -625,12 +630,12 @@ void TB_undo_move(TB_Position *pos, int m)
     pos->sq[j] = pos->sq[i];
     pos->cnt[pos->stm]++;
   } else {
-    pos->occ ^= bit[j];
+    pos->occ ^= bit(j);
   }
   if (move & PROM_FLAG)
     pos->pt[i] -= QUEEN - PAWN;
   pos->sq[i] = pos->state[pos->idx].fromSquare;
-  pos->occ ^= bit[pos->sq[i]];
+  pos->occ ^= bit(pos->sq[i]);
   pos->stm ^= 1;
 }
 
@@ -661,10 +666,10 @@ void TBitf_set_from_fen(TB_Position *pos, const char *fen, int *cnt70)
       pos->sq[0] = (r << 3) | f++;
     else if (c == 'k' && pos->sq[1] == 0xff)
       pos->sq[1] = (r << 3) | f++;
-    else if (strchr(pieceChar, c)) {
+    else if (strchr(PieceChar, c)) {
       if (pos->num == 7)
         goto too_many_pieces;
-      pos->pt[pos->num] = strchr(pieceChar, c) - pieceChar;
+      pos->pt[pos->num] = strchr(PieceChar, c) - PieceChar;
       pos->sq[pos->num++] = (r << 3) | f++;
     }
     else
@@ -714,7 +719,7 @@ void TBitf_set_from_fen(TB_Position *pos, const char *fen, int *cnt70)
 finish:
   pos->occ = 0;
   for (int i = 0; i < pos->num; i++)
-    pos->occ |= bit[pos->sq[i]];
+    pos->occ |= bit(pos->sq[i]);
 
   pos->cnt[WHITE] = pos->cnt[BLACK] = 0;
   for (int i = 2; i < pos->num; i++)
@@ -744,7 +749,7 @@ void TBitf_move_to_string(TB_Position *pos, int m, char *str)
     if (move & CAPT_FLAG)
       *str++ = 'a' + (from & 7);
   } else {
-    *str++ = pieceChar[pos->pt[i] & 7];
+    *str++ = PieceChar[pos->pt[i] & 7];
     bool sameTo = false, sameFile = false, sameRank = false;
     int num = pos->state[pos->idx + 1].firstMove - pos->state[pos->idx].firstMove;
     for (int m1 = 0; m1 < num; m1++) {
@@ -814,7 +819,7 @@ void TBitf_print_pos(TB_Position *pos)
 
   for (int r = 7; r >= 0; r--) {
     for (int f = 0; f <= 7; f++)
-      printf(" | %c", pieceChar[board[8 * r + f]]);
+      printf(" | %c", PieceChar[board[8 * r + f]]);
 
     printf(" | %d\n +---+---+---+---+---+---+---+---+\n", r + 1);
   }

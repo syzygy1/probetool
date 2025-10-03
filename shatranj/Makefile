@@ -1,4 +1,5 @@
 CC = gcc
+#CC = x86_64-w64-mingw32-gcc
 CFLAGS = -O3 -std=c11 -Wall -Wextra -pedantic -DNDEBUG
 #CFLAGS = -g3 -std=c11 -Wall -Wextra -pedantic
 
