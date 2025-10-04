@@ -181,16 +181,20 @@ INLINE uint16_t read_le_u16(const void *p)
 
 /* TB initialization and probing code */
 
-#define TB_PIECES 7
-#define TB_HASHBITS 12
-#define TB_MAX_PIECE 650
-#define TB_MAX_PAWN  861
+enum {
+  TB_PIECES = 7,
+  TB_HASHBITS = 12,
+  TB_MAX_PIECE = 650,
+  TB_MAX_PAWN = 861
+};
 
 enum { WDL = TB_WDL, DTM = TB_DTM, DTZ = TB_DTZ };
 enum { PIECE_ENC, FILE_ENC, RANK_ENC };
+enum { FAIL = 0, OK = 1, CHANGE_STM = -1, ZEROING_IS_BEST = 2 };
 
 int TB_NumTables[3];
 int TB_MaxCardinality[3];
+uint64_t TB_ProbeCount[3];
 
 static const char *suffix[] = { ".rtbw", ".rtbm", ".rtbz" };
 static uint32_t magic[] = { 0x5d23e871, 0x88ac504b, 0xa50c66d7 };
@@ -1264,7 +1268,7 @@ static const uint8_t *decompress_pairs(struct PairsData *d, size_t idx)
   return &symPat[3 * sym];
 }
 
-INLINE int probe_table(TB_Position *pos, const int s, int *success,
+INLINE int probe_table(TB_Position *pos, const int s, int *result,
     const int type)
 {
   // Test for KvK
@@ -1278,13 +1282,13 @@ INLINE int probe_table(TB_Position *pos, const int s, int *success,
   while (tbHash[hashIdx].key && tbHash[hashIdx].key != key)
     hashIdx = (hashIdx + 1) & ((1 << TB_HASHBITS) - 1);
   if (!tbHash[hashIdx].ptr) {
-    *success = 0;
+    *result = FAIL;
     return 0;
   }
 
   struct BaseEntry *be = tbHash[hashIdx].ptr;
   if ((type == DTM && !be->hasDtm) || (type == DTZ && !be->hasDtz)) {
-    *success = 0;
+    *result = FAIL;
     return 0;
   }
 
@@ -1300,7 +1304,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *success,
       }
       if (!init_table(be, be->key == key ? str : str2, type)) {
         tbHash[hashIdx].ptr = NULL; // mark as deleted
-        *success = 0;
+        *result = FAIL;
         UNLOCK(mutex);
         return 0;
       }
@@ -1332,7 +1336,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *success,
     if (type == DTZ) {
       flags = PCE_E(be)->dtzFlags;
       if ((flags & 1) != bside && !be->symmetric) {
-        *success = -1;
+        *result = CHANGE_STM;
         return 0;
       }
     }
@@ -1345,7 +1349,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *success,
     if (type == DTZ) {
       flags = PWN_E(be)->dtzFlags[t];
       if ((flags & 1) != bside && !be->symmetric) {
-        *success = -1;
+        *result = CHANGE_STM;
         return 0;
       }
     }
@@ -1354,6 +1358,8 @@ INLINE int probe_table(TB_Position *pos, const int s, int *success,
     TB_list_squares(pos, ei->pieces, flip, p);
     idx = type != DTM ? encode_pawn_f(p, ei, be) : encode_pawn_r(p, ei, be);
   }
+
+  TB_ProbeCount[type]++;
 
   const uint8_t *w = decompress_pairs(ei->precomp, idx);
 
@@ -1386,23 +1392,23 @@ INLINE int probe_table(TB_Position *pos, const int s, int *success,
   return v;
 }
 
-static NOINLINE int probe_wdl_table(TB_Position *pos, int *success)
+static NOINLINE int probe_wdl_table(TB_Position *pos, int *result)
 {
-  return probe_table(pos, 0, success, WDL);
+  return probe_table(pos, 0, result, WDL);
 }
 
-static NOINLINE int probe_dtm_table(TB_Position *pos, bool won, int *success)
+static NOINLINE int probe_dtm_table(TB_Position *pos, bool won, int *result)
 {
-  return probe_table(pos, won, success, DTM);
+  return probe_table(pos, won, result, DTM);
 }
 
-static NOINLINE int probe_dtz_table(TB_Position *pos, int wdl, int *success)
+static NOINLINE int probe_dtz_table(TB_Position *pos, int wdl, int *result)
 {
-  return probe_table(pos, wdl, success, DTZ);
+  return probe_table(pos, wdl, result, DTZ);
 }
 
 // probe_ab() is never called for positions with en passant captures.
-static int probe_ab(TB_Position *pos, int alpha, int beta, int *success)
+static int probe_ab(TB_Position *pos, int alpha, int beta, int *result)
 {
   assert(!TB_has_en_passant(pos));
 
@@ -1411,9 +1417,9 @@ static int probe_ab(TB_Position *pos, int alpha, int beta, int *success)
   for (int m = 0; m < num; m++) {
     if (!TB_do_move(pos, m))
       continue;
-    int v = -probe_ab(pos, -beta, -alpha, success);
+    int v = -probe_ab(pos, -beta, -alpha, result);
     TB_undo_move(pos, m);
-    if (*success == 0) return 0;
+    if (*result == FAIL) return 0;
     if (v > alpha) {
       if (v >= beta)
         return v;
@@ -1421,29 +1427,14 @@ static int probe_ab(TB_Position *pos, int alpha, int beta, int *success)
     }
   }
 
-  int v = probe_wdl_table(pos, success);
+  int v = probe_wdl_table(pos, result);
 
   return alpha >= v ? alpha : v;
 }
 
-// Probe the WDL table for a particular position.
-//
-// If *success != 0, the probe was successful.
-//
-// If *success == 2, the position has a winning capture, or the position
-// is a cursed win and has a cursed winning capture, or the position
-// has an ep capture as only best move.
-// This is used in probe_dtz().
-//
-// The return value is from the point of view of the side to move:
-// -2 : loss
-// -1 : loss, but draw under 50-move rule
-//  0 : draw
-//  1 : win, but draw under 50-move rule
-//  2 : win
-int TB_probe_wdl(TB_Position *pos, int *success)
+static int probe_wdl(TB_Position *pos, int *result)
 {
-  *success = 1;
+  *result = OK;
 
   int num = TB_generate_captures(pos);
   int bestCap = -3, bestEp = -3;
@@ -1455,13 +1446,13 @@ int TB_probe_wdl(TB_Position *pos, int *success)
   for (int m = 0; m < num; m++) {
     if (!TB_do_move(pos, m))
       continue;
-    int v = -probe_ab(pos, -2, -bestCap, success);
+    int v = -probe_ab(pos, -2, -bestCap, result);
     TB_undo_move(pos, m);
-    if (*success == 0)
+    if (*result == FAIL)
       return 0;
     if (v > bestCap) {
       if (v == 2) {
-        *success = 2;
+        *result = ZEROING_IS_BEST;
         return 2;
       }
       if (!TB_move_is_ep(pos, m))
@@ -1474,8 +1465,8 @@ int TB_probe_wdl(TB_Position *pos, int *success)
   // Since there is no winning capture, a non-capture might be the best
   // move. Therefore we need to probe the table.
  
-  int v = probe_wdl_table(pos, success);
-  if (*success == 0) return 0;
+  int v = probe_wdl_table(pos, result);
+  if (*result == FAIL) return 0;
 
   // Now max(v, bestCap) is the WDL value of the position without ep rights.
   // If the position without ep rights is not stalemate or no ep captures
@@ -1487,7 +1478,7 @@ int TB_probe_wdl(TB_Position *pos, int *success)
 
   if (bestEp > bestCap) {
     if (bestEp > v) { // ep capture (possibly blessed losing) is best.
-      *success = 2;
+      *result = ZEROING_IS_BEST;
       return bestEp;
     }
     bestCap = bestEp;
@@ -1499,7 +1490,8 @@ int TB_probe_wdl(TB_Position *pos, int *success)
   if (bestCap >= v) {
     // No need to test for the stalemate case here: either there are
     // non-ep captures, or bestCap == bestEp >= v anyway.
-    *success = 1 + (bestCap > 0);
+    if (bestCap > 0)
+      *result = ZEROING_IS_BEST;
     return bestCap;
   }
 
@@ -1514,8 +1506,8 @@ int TB_probe_wdl(TB_Position *pos, int *success)
       if (TB_move_is_legal(pos, m))
         goto no_stalemate;
 
-    // Stalemate detected.
-    *success = 2;
+    // Stalemate detected -> ep capture is best.
+    *result = ZEROING_IS_BEST;
     return bestEp;
   }
 
@@ -1524,28 +1516,50 @@ no_stalemate:
   return v;
 }
 
-static int probe_dtm_win(TB_Position *pos, int *success);
+// Probe the WDL table for a particular position.
+//
+// The caller should verify that the probe was successful by checking
+// the value of *success.
+//
+// The return value is from the point of view of the side to move:
+// -2 : loss
+// -1 : loss, but draw under 50-move rule
+//  0 : draw
+//  1 : win, but draw under 50-move rule
+//  2 : win
+int TB_probe_wdl(TB_Position *pos, bool *success)
+{
+  int result, v = probe_wdl(pos, &result);
+  *success = result != FAIL;
+  return v;
+}
+
+static int probe_dtm_win(TB_Position *pos, int lower, int upper, int *result);
 
 // Probe a position known to lose by probing the DTM table and looking
-// at captures.
-static int probe_dtm_loss(TB_Position *pos, int *success)
+// at captures. Lower and upper are essentially alpha/beta bounds.
+static int probe_dtm_loss(TB_Position *pos, int lower, int upper, int *result)
 {
-  int v, best = 0;
   bool legalCaps = false, legalEpCaps = false;
 
-  int num = TB_generate_captures(pos);
+  int v, num = TB_generate_captures(pos);
 
   for (int m = 0; m < num; m++) {
     if (!TB_do_move(pos, m))
       continue;
-    v = probe_dtm_win(pos, success);
+    v = probe_dtm_win(pos, max(1, lower), upper, result);
     TB_undo_move(pos, m);
     if (TB_move_is_ep(pos, m))
       legalEpCaps = true;
     else
       legalCaps = true;
-    best = max(best, v);
-    if (*success == 0)
+    if (v > lower) {
+      lower = v;
+      if (v >= upper) {
+        return v;
+      }
+    }
+    if (*result == FAIL)
       return 0;
   }
 
@@ -1556,17 +1570,21 @@ static int probe_dtm_loss(TB_Position *pos, int *success)
     for (int m = 0; m < num; m++)
       if (TB_move_is_legal(pos, m))
         goto no_stalemate;
-    return best;
+    return lower;
   }
 
 no_stalemate:
-  v = probe_dtm_table(pos, false, success);
-  return max(best, v);
+  v = probe_dtm_table(pos, false, result);
+  return max(lower, v);
 }
 
-static int probe_dtm_win(TB_Position *pos, int *success)
+// Probe a position known to lose by probing the DTM table and looking
+// at captures. Lower and upper are essentially alpha/beta bounds.
+// Invoke with lower > 0.
+static int probe_dtm_win(TB_Position *pos, int lower, int upper, int *result)
 {
-  int v, best = 10000;
+  if (upper == 1)
+    return 1;
 
   int num = TB_generate_captures(pos);
   num = TB_generate_quiets(pos, num);
@@ -1575,18 +1593,20 @@ static int probe_dtm_win(TB_Position *pos, int *success)
   for (int m = 0; m < num; m++) {
     if (!TB_do_move(pos, m))
       continue;
-    if (   (TB_has_en_passant(pos) ? TB_probe_wdl(pos, success)
-                                    : probe_ab(pos, -1, 0, success)) < 0
-        && *success)
+    if (   (TB_has_en_passant(pos) ? probe_wdl(pos, result)
+                                   : probe_ab(pos, -1, 0, result)) < 0
+        && *result != FAIL)
     {
-      v = probe_dtm_loss(pos, success) + 1;
-      best = min(best, v);
+      int v = probe_dtm_loss(pos, lower - 1, upper - 1, result) + 1;
+      if (v < upper)
+        upper = v;
     }
     TB_undo_move(pos, m);
-    if (*success == 0) return 0;
+    if (upper <= lower || *result == FAIL)
+      break;
   }
 
-  return best;
+  return upper;
 }
 
 // Probe the DTM table for a non-drawn position.
@@ -1594,16 +1614,39 @@ static int probe_dtm_win(TB_Position *pos, int *success)
 // false if the position is a loss or blessed loss.
 // The value returned is the number of moves to mate. Positive if winning,
 // negative if losing.
-int TB_probe_dtm(TB_Position *pos, bool won, int *success)
+int TB_probe_dtm(TB_Position *pos, bool won, bool *success)
 {
-  *success = 1;
-  return won ? probe_dtm_win(pos, success) : -probe_dtm_loss(pos, success);
+  int result = OK;
+  int dtm = won ?  probe_dtm_win (pos, 1, 10000, &result)
+                : -probe_dtm_loss(pos, 0, 10000, &result);
+  *success = result != FAIL;
+  return dtm;
+}
+
+// Test whether the current position is a DTM-optimal successor of the
+// parent position. The (signed) dtm value passed must be the expected
+// DTM value of a DTM-optimal succesor. If the parent position has DTM
+// value d, then pass (d > 0) - d.
+bool TB_probe_dtm_test(TB_Position *pos, int dtm, bool *success)
+{
+  int result = OK;
+
+  // If dtm > 0, we assume the position is winning (which is the case if
+  // the parent position is losing).
+  int v =  dtm > 0 ?  v = probe_dtm_win(pos, dtm - 1, dtm, &result) >= dtm
+         : (   (TB_has_en_passant(pos) ? probe_wdl(pos, &result)
+                                       : probe_ab(pos, -1, 0, &result)) >= 0
+            || result == FAIL) ? false
+         : probe_dtm_loss(pos, -dtm, -dtm - 1, &result) <= -dtm;
+  *success = result != FAIL;
+
+  return v;
 }
 
 static int WdlToDtz[] = { -1, -101, 0, 101, 1 };
 
 // Probe the DTZ table for a particular position.
-// If *success != 0, the probe was successful.
+// If *success == true, the probe was successful.
 // The return value is from the point of view of the side to move:
 //         n < -100 : loss, but draw under 50-move rule
 // -100 <= n < -1   : loss in n ply (assuming 50-move counter == 0)
@@ -1630,19 +1673,24 @@ static int WdlToDtz[] = { -1, -101, 0, 101, 1 };
 // In short, if a move is available resulting in dtz + 50-move-counter <= 99,
 // then do not accept moves leading to dtz + 50-move-counter == 100.
 //
-int TB_probe_dtz(TB_Position *pos, int *success)
+int TB_probe_dtz(TB_Position *pos, bool *success)
 {
-  int wdl = TB_probe_wdl(pos, success);
-  if (*success == 0) return 0;
+  int result = OK;
+  *success = true;
+
+  int wdl = probe_wdl(pos, &result);
+  if (result == FAIL)
+    goto fail;
 
   // If draw, then dtz = 0.
-  if (wdl == 0) return 0;
+  if (wdl == 0)
+    return 0;
 
   // Check for winning capture or en passant capture as only best move.
-  if (*success == 2)
+  if (result == ZEROING_IS_BEST)
     return WdlToDtz[wdl + 2];
 
-  int num;
+  int num = 0;
 
   // If winning, check for a winning pawn move.
   if (wdl > 0) {
@@ -1650,13 +1698,16 @@ int TB_probe_dtz(TB_Position *pos, int *success)
     num = TB_generate_quiets(pos, 0);
 
     for (int m = 0; m < num; m++) {
+      // We check only pawn moves here.
       if (!TB_move_is_pawn_move(pos, m))
         continue;
       if (!TB_do_move(pos, m))
         continue;
-      int v = -TB_probe_wdl(pos, success);
+      // TODO: add alpha/beta bounds to next call
+      int v = -probe_wdl(pos, &result);
       TB_undo_move(pos, m);
-      if (*success == 0) return 0;
+      if (result == FAIL)
+        goto fail;
       if (v == wdl)
         return WdlToDtz[wdl + 2];
     }
@@ -1667,16 +1718,16 @@ int TB_probe_dtz(TB_Position *pos, int *success)
   // the position without ep rights. It is therefore safe to probe the
   // DTZ table with the current value of wdl.
 
-  int dtz = probe_dtz_table(pos, wdl, success);
-  if (*success >= 0)
+  int dtz = probe_dtz_table(pos, wdl, &result);
+  if (result == FAIL)
+    goto fail;
+  if (result != CHANGE_STM)
     return WdlToDtz[wdl + 2] + ((wdl > 0) ? dtz : -dtz);
 
-  // *success < 0 means we need to probe DTZ for the other side to move.
-  int best;
-  if (wdl > 0) {
-    best = INT32_MAX;
-    // If wdl > 0, we have already generated quiet moves.
-  } else {
+  // CHANGE_STM means we need to probe DTZ for the other side to move.
+  int best = INT32_MAX;
+  // If wdl > 0, we have already generated quiet moves.
+  if (wdl < 0) {
     // If (blessed) loss, the worst case is a losing capture or pawn move
     // as the "best" move, meaning dtz is -1 or -101.
     // In case of mate, this will cause -1 to be returned.
@@ -1686,8 +1737,8 @@ int TB_probe_dtz(TB_Position *pos, int *success)
   }
 
   for (int m = 0; m < num; m++) {
-    // We can skip pawn moves.
-    // If wdl > 0, we already caught them. If wdl < 0, the initial value
+    // We can skip pawn moves. If wdl > 0, we already checked them, and
+    // they were worse than wdl. If wdl < 0, the initial value
     // of best already takes account of them.
     if (TB_move_is_pawn_move(pos, m))
       continue;
@@ -1706,7 +1757,13 @@ int TB_probe_dtz(TB_Position *pos, int *success)
         best = v - 1;
     }
     TB_undo_move(pos, m);
-    if (*success == 0) return 0;
+    if (!success)
+      break;
   }
+
   return best;
+
+fail:
+  *success = false;
+  return 0;
 }

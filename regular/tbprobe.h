@@ -17,6 +17,10 @@ enum { TB_WDL, TB_DTM, TB_DTZ };
 // Number of detected WDL, DTM and DTZ tables
 extern int TB_NumTables[3];
 
+// Counts of actual probes, i.e. accesses of compressed tablebase data.
+// (Not intended to be reported to the user by an engine.)
+extern uint64_t TB_ProbeCount[3];
+
 // No need to try to probe if the number of pieces > MaxCardinality
 extern int TB_MaxCardinality[3];
 
@@ -41,12 +45,8 @@ void TB_free(void);
 
 // Probe the WDL table for a particular position.
 //
-// If *success != 0, the probe was successful.
-//
-// If *success == 2, the position has a winning capture, or the position
-// is a cursed win and has a cursed winning capture, or the position
-// has an ep capture as only best move.
-// (This is used in probe_dtz() and can otherwise be ignored.)
+// The caller should verify that the probe was successfull by checking
+// the value *succes.
 //
 // The return value is from the point of view of the side to move:
 // -2 : loss
@@ -54,10 +54,10 @@ void TB_free(void);
 //  0 : draw
 //  1 : win, but draw under 50-move rule
 //  2 : win
-int TB_probe_wdl(TB_Position *pos, int *success);
+int TB_probe_wdl(TB_Position *pos, bool *success);
 
 // Probe the DTZ table for a particular position.
-// If *success != 0, the probe was successful.
+// If *success true, the probe was successful.
 // The return value is from the point of view of the side to move:
 //         n < -100 : loss, but draw under 50-move rule
 // -100 <= n < -1   : loss in n ply (assuming 50-move counter == 0)
@@ -83,7 +83,7 @@ int TB_probe_wdl(TB_Position *pos, int *success);
 //
 // In short, if a move is available resulting in dtz + 50-move-counter <= 99,
 // then do not accept moves leading to dtz + 50-move-counter == 100.
-int TB_probe_dtz(TB_Position *pos, int *success);
+int TB_probe_dtz(TB_Position *pos, bool *success);
 
 // Probe the DTM table for a non-drawn position.
 // 'won' must be true if the position is a win or cursed win and
@@ -93,7 +93,13 @@ int TB_probe_dtz(TB_Position *pos, int *success);
 //
 // NOTE: Syzygy DTM tables have not yet been released. So this function
 // can be ignored for now.
-int TB_probe_dtm(TB_Position *pos, bool winning, int *success);
+int TB_probe_dtm(TB_Position *pos, bool winning, bool *success);
+
+// Test whether the current position is a DTM-optimal successor of the
+// parent position. The (signed) dtm value passed must be the expected
+// DTM value of a DTM-optimal succesor. If the parent position has DTM
+// value d, then pass (d > 0) - d.
+bool TB_probe_dtm_test(TB_Position *pos, int dtm, bool *success);
 
 
 /********************* Functions required by tbprobe.c *********************/

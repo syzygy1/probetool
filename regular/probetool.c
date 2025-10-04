@@ -4,6 +4,7 @@
 */
 
 #include <getopt.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -30,11 +31,12 @@ static int cnt50;
 static char *fen;
 static int col;
 static bool uciMoves = false;
+static bool reportStats = false;
 
 // Don't go over 79 chars per line
 void output(const char *str)
 {
-  if (col + (int)strlen(str) > 79) {
+  if (!uciMoves && col + (int)strlen(str) > 79) {
     putc('\n', stdout);
     col = 0;
   }
@@ -47,13 +49,13 @@ void output(const char *str)
 // Print a DTZ50-optimal line of moves leading to mate.
 void print_pv_dtz(TB_Position *pos)
 {
-  int success, k = 0;
-  char str[32];
-  char moveStr[16];
-  int pv[2000];
+  char str[32], moveStr[16];
+  int pv[2000], k = 0;
+  bool success;
 
   printf("\nDTZ50-optimal mating line:\n[FEN \"%s\"]\n", fen);
   col = 0;
+  TB_ProbeCount[TB_WDL] = TB_ProbeCount[TB_DTZ] = 0;
 
   int bestScore;
   do {
@@ -94,9 +96,9 @@ void print_pv_dtz(TB_Position *pos)
     }
     if (bestScore == -10001)
       break;
-    if (TB_white_to_move(pos))
+    if (!uciMoves && TB_white_to_move(pos))
       sprintf(str, " %d.", 1 + (k + 1) / 2);
-    else if (k == 0)
+    else if (!uciMoves && k == 0)
       strcpy(str, "1...");
     else
       strcpy(str, " ");
@@ -115,75 +117,76 @@ exit:
     TB_undo_move(pos, pv[--k]);
 
   printf("\n");
+  if (reportStats) {
+    printf("ProbeCount[WDL] = %"PRIu64"\n", TB_ProbeCount[TB_WDL]);
+    printf("ProbeCount[DTZ] = %"PRIu64"\n", TB_ProbeCount[TB_DTZ]);
+  }
 }
 
 // Print a DTM-optimal line of moves leading to mate.
-void print_pv_dtm(TB_Position *pos)
+// This function must be called with the known DTM value of the position.
+void print_pv_dtm(TB_Position *pos, int dtm)
 {
-  int success, k = 0;
-  char str[32];
-  char moveStr[16];
-  int pv[2000];
+  char str[32], moveStr[16];
+  int pv[2000], k = 0;
+  bool success;
+
+  if (dtm == 0)
+    return;
 
   printf("\nDTM-optimal mating line:\n[FEN \"%s\"]\n", fen);
   col = 0;
-  int winning = TB_probe_wdl(pos, &success) > 0;
-  if (success == 0) {
-    printf("*\n");
-    return;
-  }
+  TB_ProbeCount[TB_WDL] = TB_ProbeCount[TB_DTM] = 0;
 
-  int bestScore;
   do {
     int numCaps = TB_generate_captures(pos);
     int numMoves = TB_generate_quiets(pos, numCaps);
 
-    int v, bestMove = 0;
-    bestScore = -10001;
-    for (int m = 0; m < numMoves; m++) {
+    // Calculate the DTM value of the optimal successor position.
+    dtm = (dtm > 0) - dtm;
+    int m;
+    for (m = 0; m < numMoves; m++) {
       if (!TB_do_move(pos, m))
         continue;
-      // If the parent position is winning, we need to check that this is
-      // one of the winning moves, i.e. the position is now losing.
-      if (!winning || TB_probe_wdl(pos, &success) < 0) {
-        int dtm = success ? -TB_probe_dtm(pos, !winning, &success) : 0;
-        // Convert dtm to a "linear" score that allows for easy comparison.
-        v = dtm >= 0 ? 10000 - dtm : -10000 - dtm;
-        if (v > bestScore) {
-          bestScore = v;
-          bestMove = m;
-        }
-      }
+      bool isOptimal = TB_probe_dtm_test(pos, dtm, &success);
       TB_undo_move(pos, m);
       if (!success) {
         output(" *");
         goto exit;
       }
+      if (isOptimal)
+        break;
     }
-    if (bestScore == -10001)
-      break;
-    if (TB_white_to_move(pos))
+    if (m == numMoves) {
+      output(" *");
+      goto exit;
+    }
+    if (!uciMoves && TB_white_to_move(pos))
       sprintf(str, " %d.", 1 + (k + 1) / 2);
-    else if (k == 0)
+    else if (!uciMoves && k == 0)
       strcpy(str, "1...");
     else
       strcpy(str, " ");
     if (uciMoves)
-      TBitf_move_to_string_uci(pos, bestMove, moveStr);
+      TBitf_move_to_string_uci(pos, m, moveStr);
     else
-      TBitf_move_to_string(pos, bestMove, moveStr);
+      TBitf_move_to_string(pos, m, moveStr);
     strcat(str, moveStr);
     output(str);
-    TB_do_move(pos, bestMove);
-    pv[k++] = bestMove;
-    winning = !winning;
-  } while (bestScore < 10000 && k < 2000);
+    TB_do_move(pos, m);
+    pv[k++] = m;
+  } while (dtm && k < 2000);
 
 exit:
   while (k > 0)
     TB_undo_move(pos, pv[--k]);
 
   printf("\n");
+
+  if (reportStats) {
+    printf("ProbeCount[WDL] = %"PRIu64"\n", TB_ProbeCount[TB_WDL]);
+    printf("ProbeCount[DTM] = %"PRIu64"\n", TB_ProbeCount[TB_DTM]);
+  }
 }
 
 struct RootMove {
@@ -223,7 +226,8 @@ bool root_probe_dtz(TB_Position *pos)
   int numCaps = TB_generate_captures(pos);
   int num = TB_generate_quiets(pos, numCaps);
 
-  int dtz, success, i = 0;
+  int dtz, i = 0;
+  bool success;
 
   for (int m = 0; m < num; m++) {
     bool zeroingMove = m < numCaps || TB_move_is_pawn_move(pos, m);
@@ -284,7 +288,8 @@ bool root_probe_wdl(TB_Position *pos)
   int numCaps = TB_generate_captures(pos);
   int num = TB_generate_quiets(pos, numCaps);
 
-  int v, success, i = 0;
+  int v, i = 0;
+  bool success;
 
   // Probe, rank and score each move.
   for (int m = 0; m < num; m++) {
@@ -311,12 +316,11 @@ bool root_probe_dtm(TB_Position *pos)
   int numCaps = TB_generate_captures(pos);
   TB_generate_quiets(pos, numCaps);
 
-  int success, i;
-
   int val[MAX_MOVES];
+  bool success;
 
   // Probe each move
-  for (i = 0; i < numRootMoves; i++) {
+  for (int i = 0; i < numRootMoves; i++) {
     // Find out whether the move is winning or losing or drawing based
     // on the DTZ or WDL root probe.
     int s = rootMove[i].score;
@@ -331,7 +335,7 @@ bool root_probe_dtm(TB_Position *pos)
       // Convert dtm into a mate score
       val[i] = dtm > 0 ?  VALUE_MATE - (2 * dtm - 1)
                        : -VALUE_MATE - 2 * dtm;
-      if (success == 0)
+      if (!success)
         return false;
     }
   }
@@ -417,7 +421,7 @@ int main(int argc, char *argv[])
 
   bool rootProbe = false, wdlRootProbe = false;
   int val;
-  while ((val = getopt(argc, argv, "p:ruw")) != -1) {
+  while ((val = getopt(argc, argv, "p:ruws")) != -1) {
     switch (val) {
     case 'p':
       path = optarg;
@@ -431,6 +435,9 @@ int main(int argc, char *argv[])
     case 'w':
       wdlRootProbe = true;
       break;
+    case 's':
+      reportStats = true;
+      break;
     }
   }
 
@@ -439,7 +446,7 @@ int main(int argc, char *argv[])
       TB_NumTables[TB_WDL], TB_NumTables[TB_DTZ], TB_NumTables[TB_DTM]);
 
   if (optind >= argc) {
-    printf("USAGE: %s [-p <path>] [-u] [-r] [-w] <fen>\n", argv[0]);
+    printf("USAGE: %s [-p <path>] [-u] [-r] [-w] [-s] <fen>\n", argv[0]);
     return 0;
   }
   fen = argv[optind];
@@ -451,21 +458,23 @@ int main(int argc, char *argv[])
 
   TBitf_print_pos(pos);
 
-  int successWdl, successDtz, successDtm = false;
-  int wdl = TB_probe_wdl(pos, &successWdl);
+  bool successWdl, successDtz, successDtm = false;
+  int wdl, dtz, dtm = 0;
+
+  wdl = TB_probe_wdl(pos, &successWdl);
   if (successWdl)
     printf("WDL = %d (%s)\n", wdl, wdlStr[wdl + 2]);
   else
     printf("WDL probe failed.\n");
 
-  int dtz = TB_probe_dtz(pos, &successDtz);
+  dtz = TB_probe_dtz(pos, &successDtz);
   if (successDtz)
     printf("DTZ50 = %d ply\n", dtz);
   else
     printf("DTZ probe failed.\n");
 
   if (TB_NumTables[TB_DTM] > 0) {
-    int dtm = TB_probe_dtm(pos, wdl > 0, &successDtm);
+    dtm = TB_probe_dtm(pos, wdl > 0, &successDtm);
     if (successDtm)
       printf("DTM = %d moves\n", dtm);
     else
@@ -476,7 +485,7 @@ int main(int argc, char *argv[])
     print_pv_dtz(pos);
 
   if (successDtm && wdl != 0)
-    print_pv_dtm(pos);
+    print_pv_dtm(pos, dtm);
 
   if (!rootProbe)
     goto exit;

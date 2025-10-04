@@ -19,6 +19,12 @@ tbinterface.o: $(TBINTERFACE).c tbprobe.h tbinterface.h
 probetool: probetool.o tbprobe.o $(TBINTERFACE).o
 	$(CC) $(CFLAGS) -o probetool probetool.o tbprobe.o $(TBINTERFACE).o
 
+probetool_bb: probetool.o tbprobe.o tbinterface_bb.o
+	$(CC) $(CFLAGS) -o probetool_bb probetool.o tbprobe.o tbinterface_bb.o
+
+probetool_0x88: probetool.o tbprobe.o tbinterface_0x88.o
+	$(CC) $(CFLAGS) -o probetool_0x88 probetool.o tbprobe.o tbinterface_0x88.o
+
 clean:
 	rm -rf *.o
 
