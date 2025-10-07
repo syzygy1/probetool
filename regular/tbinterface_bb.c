@@ -808,6 +808,8 @@ void TBitf_set_from_fen(TB_Position *pos, const char *fen, int *cnt50)
       pos->sq[0] = (r << 3) | f++;
     else if (c == 'k' && pos->sq[1] == 0xff)
       pos->sq[1] = (r << 3) | f++;
+    else if (c == 'K' || c == 'k')
+      goto illegal_fen;
     else if (strchr(pieceChar, c)) {
       if (pos->num == 7)
         goto too_many_pieces;

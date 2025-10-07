@@ -19,6 +19,13 @@ jtbinterface.o: $(TBINTERFACE).c jtbprobe.h jtbinterface.h
 jprobetool: jprobetool.o jtbprobe.o $(TBINTERFACE).o
 	$(CC) $(CFLAGS) -o jprobetool jprobetool.o jtbprobe.o $(TBINTERFACE).o
 
+jprobetool_bb: jprobetool.o jtbprobe.o jtbinterface_bb.o
+	$(CC) $(CFLAGS) -o jprobetool_bb jprobetool.o jtbprobe.o jtbinterface_bb.o
+
+jprobetool_0x88: jprobetool.o jtbprobe.o jtbinterface_0x88.o
+	$(CC) $(CFLAGS) -o jprobetool_0x88 jprobetool.o jtbprobe.o jtbinterface_0x88.o
+
+
 clean:
 	rm -rf *.o
 
