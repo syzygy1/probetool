@@ -458,7 +458,7 @@ int main(int argc, char *argv[])
 
   TBitf_print_pos(pos);
 
-  bool successWdl, successDtz, successDtm = false;
+  bool successWdl, successDtz = false, successDtm = false;
   int wdl, dtz, dtm = 0;
 
   wdl = TB_probe_wdl(pos, &successWdl);
@@ -467,18 +467,20 @@ int main(int argc, char *argv[])
   else
     printf("WDL probe failed.\n");
 
-  dtz = TB_probe_dtz(pos, &successDtz);
-  if (successDtz)
-    printf("DTZ50 = %d ply\n", dtz);
-  else
-    printf("DTZ probe failed.\n");
-
-  if (TB_NumTables[TB_DTM] > 0) {
-    dtm = TB_probe_dtm(pos, wdl > 0, &successDtm);
-    if (successDtm)
-      printf("DTM = %d moves\n", dtm);
+  if (wdl != 0) {
+    dtz = TB_probe_dtz(pos, &successDtz);
+    if (successDtz)
+      printf("DTZ50 = %d ply\n", dtz);
     else
-      printf("DTM probe failed.\n");
+      printf("DTZ probe failed.\n");
+
+    if (TB_NumTables[TB_DTM] > 0) {
+      dtm = TB_probe_dtm(pos, wdl > 0, &successDtm);
+      if (successDtm)
+        printf("DTM = %d moves\n", dtm);
+      else
+        printf("DTM probe failed.\n");
+    }
   }
 
   if (successDtz && wdl != 0)
