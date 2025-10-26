@@ -1422,16 +1422,14 @@ static int probe_ab(TB_Position *pos, int alpha, int beta, int *result)
     int v = -probe_ab(pos, -beta, -alpha, result);
     TB_undo_move(pos, m);
     if (*result == FAIL) return 0;
-    if (v > alpha) {
-      if (v >= beta)
-        return v;
-      alpha = v;
-    }
+    alpha = max(alpha, v);
+    if (alpha >= beta)
+      return alpha;
   }
 
   int v = probe_wdl_table(pos, result);
 
-  return alpha >= v ? alpha : v;
+  return max(alpha, v);
 }
 
 static int probe_wdl(TB_Position *pos, int *result)
@@ -1459,8 +1457,8 @@ static int probe_wdl(TB_Position *pos, int *result)
       }
       if (!TB_move_is_ep(pos, m))
         bestCap = v;
-      else if (v > bestEp)
-        bestEp = v;
+      else
+        bestEp = max(bestEp, v);
     }
   }
 
@@ -1536,11 +1534,11 @@ int TB_probe_wdl(TB_Position *pos, bool *success)
   return v;
 }
 
-static int probe_dtm_win(TB_Position *pos, int lower, int upper, int *result);
+static int probe_dtm_win(TB_Position *pos, int alpha, int beta, int *result);
 
 // Probe a position known to lose by probing the DTM table and looking
-// at captures. Lower and upper are essentially alpha/beta bounds.
-static int probe_dtm_loss(TB_Position *pos, int lower, int upper, int *result)
+// at captures. Losing DTM values are negative -> we want to minimize them.
+static int probe_dtm_loss(TB_Position *pos, int alpha, int beta, int *result)
 {
   bool legalCaps = false, legalEpCaps = false;
 
@@ -1549,18 +1547,15 @@ static int probe_dtm_loss(TB_Position *pos, int lower, int upper, int *result)
   for (int m = 0; m < num; m++) {
     if (!TB_do_move(pos, m))
       continue;
-    v = probe_dtm_win(pos, max(1, lower), upper, result);
+    v = -probe_dtm_win(pos, max(1, -beta), -alpha, result);
     TB_undo_move(pos, m);
     if (TB_move_is_ep(pos, m))
       legalEpCaps = true;
     else
       legalCaps = true;
-    if (v > lower) {
-      lower = v;
-      if (v >= upper) {
-        return v;
-      }
-    }
+    beta = min(beta, v);
+    if (beta <= alpha)
+      return beta;
     if (*result == FAIL)
       return 0;
   }
@@ -1572,21 +1567,20 @@ static int probe_dtm_loss(TB_Position *pos, int lower, int upper, int *result)
     for (int m = 0; m < num; m++)
       if (TB_move_is_legal(pos, m))
         goto no_stalemate;
-    return lower;
+    return beta;
   }
 
 no_stalemate:
-  v = probe_dtm_table(pos, false, result);
-  return max(lower, v);
+  v = -probe_dtm_table(pos, false, result);
+  return min(beta, v);
 }
 
-// Probe a position known to lose by probing the DTM table and looking
-// at captures. Lower and upper are essentially alpha/beta bounds.
-// Invoke with lower > 0.
-static int probe_dtm_win(TB_Position *pos, int lower, int upper, int *result)
+// Probe a position known to win by probing the DTM table and looking
+// at captures. Winning DTM values are positive -> we want to minimize them.
+static int probe_dtm_win(TB_Position *pos, int alpha, int beta, int *result)
 {
-  if (upper == 1)
-    return 1;
+  if (beta <= alpha)
+    return beta;
 
   int num = TB_generate_captures(pos);
   num = TB_generate_quiets(pos, num);
@@ -1599,16 +1593,15 @@ static int probe_dtm_win(TB_Position *pos, int lower, int upper, int *result)
                                    : probe_ab(pos, -1, 0, result)) < 0
         && *result != FAIL)
     {
-      int v = probe_dtm_loss(pos, lower - 1, upper - 1, result) + 1;
-      if (v < upper)
-        upper = v;
+      int v = 1 - probe_dtm_loss(pos, 1 - beta, 1 - alpha, result);
+      beta = min(beta, v);
     }
     TB_undo_move(pos, m);
-    if (upper <= lower || *result == FAIL)
+    if (beta <= alpha || *result == FAIL)
       break;
   }
 
-  return upper;
+  return beta;
 }
 
 // Probe the DTM table for a non-drawn position.
@@ -1619,8 +1612,8 @@ static int probe_dtm_win(TB_Position *pos, int lower, int upper, int *result)
 int TB_probe_dtm(TB_Position *pos, bool won, bool *success)
 {
   int result = OK;
-  int dtm = won ?  probe_dtm_win (pos, 1, 10000, &result)
-                : -probe_dtm_loss(pos, 0, 10000, &result);
+  int dtm = won ? probe_dtm_win (pos, 1, 10000, &result)
+                : probe_dtm_loss(pos, -10000, 0, &result);
   *success = result != FAIL;
   return dtm;
 }
@@ -1635,11 +1628,11 @@ bool TB_probe_dtm_test(TB_Position *pos, int dtm, bool *success)
 
   // If dtm > 0, we assume the position is winning (which is the case if
   // the parent position is losing).
-  int v =  dtm > 0 ?  v = probe_dtm_win(pos, dtm - 1, dtm, &result) >= dtm
+  int v =  dtm > 0 ? probe_dtm_win(pos, dtm - 1, dtm, &result) >= dtm
          : (   (TB_has_en_passant(pos) ? probe_wdl(pos, &result)
                                        : probe_ab(pos, -1, 0, &result)) >= 0
             || result == FAIL) ? false
-         : probe_dtm_loss(pos, -dtm, -dtm - 1, &result) <= -dtm;
+         : probe_dtm_loss(pos, dtm - 1, dtm, &result) >= dtm;
   *success = result != FAIL;
 
   return v;
