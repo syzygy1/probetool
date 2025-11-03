@@ -300,7 +300,7 @@ static bool test_tb(const char *str, const char *suffix)
     size_t size = file_size(fd);
     close_file(fd);
     if ((size & 63) != 16) {
-      fprintf(stderr, "Incomplete tablebase file %s.%s\n", str, suffix);
+      fprintf(stderr, "Incomplete tablebase file %s%s\n", str, suffix);
       fd = FD_ERR;
     }
   }
@@ -936,13 +936,11 @@ static NOINLINE size_t encode_pawn_r(int *p, struct EncInfo *ei,
 static size_t subfactor(size_t k, size_t n)
 {
   size_t f = n;
-  size_t l = 1;
-  for (size_t i = 1; i < k; i++) {
-    f *= n - i;
-    l *= i + 1;
-  }
 
-  return f / l;
+  for (size_t i = 1; i < k; i++)
+    f = (f * (n-i)) / (i + 1);
+
+  return f;
 }
 
 static size_t init_enc_info(struct EncInfo *ei, struct BaseEntry *be,
