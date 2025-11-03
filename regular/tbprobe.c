@@ -1045,7 +1045,7 @@ static struct PairsData *setup_pairs(const uint8_t **ptr, size_t tb_size,
   size[1] = 2ULL * numBlocks;
   size[2] = (size_t)realNumBlocks << blockSize;
 
-  char tmp[numSyms];
+  char tmp[4096];
   memset(tmp, 0, numSyms);
   for (uint32_t s = 0; s < numSyms; s++)
     if (!tmp[s])
@@ -1253,13 +1253,13 @@ static const uint8_t *decompress_pairs(struct PairsData *d, size_t idx)
 
   const uint8_t *symPat = d->symPat;
   while (symLen[sym] != 0) {
-    const uint8_t *w = symPat + (3 * sym);
-    int s1 = ((w[1] & 0xf) << 8) | w[0];
+    uint32_t w = read_le_u32(symPat + 3 * sym);
+    int s1 = w & 0xfff;
     if (litIdx < (int)symLen[s1] + 1)
       sym = s1;
     else {
       litIdx -= (int)symLen[s1] + 1;
-      sym = (w[2] << 4) | (w[1] >> 4);
+      sym = (w >> 12) & 0xfff;
     }
   }
 
