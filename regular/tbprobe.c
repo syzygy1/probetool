@@ -1759,6 +1759,83 @@ bool TB_probe_dtm_test(TB_Position *pos, int dtm, bool *success)
 
 static int WdlToDtz[] = { -1, -101, 0, 101, 1 };
 
+// This function assumes probe_wdl() has been called and *result has
+// been checked for ZEROING_IS_BEST (or != OK). In other words, when this
+// function is called, there is no winning capture, and ep capture is not
+// the best move.
+int probe_dtz(TB_Position *pos, int wdl, int *result)
+{
+  int num = 0;
+
+  // If winning, check for a winning pawn move.
+  if (wdl > 0) {
+    // Generate all quiet moves including promotions.
+    num = TB_generate_quiets(pos, 0);
+
+    for (int m = 0; m < num; m++) {
+      // We check only pawn moves here.
+      if (!TB_move_is_pawn_move(pos, m))
+        continue;
+      if (!TB_do_move(pos, m))
+        continue;
+      // TODO: add alpha/beta bounds to next call
+      int v = -probe_wdl(pos, result);
+      TB_undo_move(pos, m);
+      if (v == wdl || *result == FAIL)
+        return WdlToDtz[wdl + 2];
+    }
+  }
+
+  // If we are here, we know that the best move is not an ep capture.
+  // In other words, the value of wdl corresponds to the WDL value of
+  // the position without ep rights. It is therefore safe to probe the
+  // DTZ table with the current value of wdl.
+
+  int dtz = probe_dtz_table(pos, wdl, result);
+  if (*result != CHANGE_STM)
+    return WdlToDtz[wdl + 2] + ((wdl > 0) ? dtz : -dtz);
+
+  *result = OK;
+  // CHANGE_STM means we need to probe DTZ for the other side to move.
+  int best = INT32_MAX;
+  // If wdl > 0, we have already generated quiet moves.
+  if (wdl < 0) {
+    // If (blessed) loss, the worst case is a losing capture or pawn move
+    // as the "best" move, meaning dtz is -1 or -101.
+    // In case of mate, this will cause -1 to be returned.
+    best = WdlToDtz[wdl + 2];
+    // If wdl < 0, we still have to generate quiet moves.
+    num = TB_generate_quiets(pos, 0);
+  }
+
+  for (int m = 0; m < num; m++) {
+    // We can skip pawn moves. If wdl > 0, we already checked them, and
+    // they were worse than wdl. If wdl < 0, the initial value
+    // of best already takes account of them.
+    if (TB_move_is_pawn_move(pos, m))
+      continue;
+    if (!TB_do_move(pos, m))
+      continue;
+    int wdl_next = probe_wdl(pos, result);
+    // Only look further at move m if it does not worsen the position.
+    if (wdl <= -wdl_next) {
+      int v =  *result != OK ? -WdlToDtz[wdl_next + 2]
+             : -probe_dtz(pos, wdl_next, result);
+      if (v == 1 && TB_in_check(pos) && TB_no_legal_moves(pos))
+        best = 1;
+      else if (wdl > 0)
+        best = min(best, v + 1);
+      else
+        best = min(best, v - 1);
+    }
+    TB_undo_move(pos, m);
+    if (*result == FAIL)
+      break;
+  }
+
+  return best;
+}
+
 // Probe the DTZ table for a particular position.
 // If *success == true, the probe was successful.
 // The return value is from the point of view of the side to move:
@@ -1790,96 +1867,9 @@ static int WdlToDtz[] = { -1, -101, 0, 101, 1 };
 int TB_probe_dtz(TB_Position *pos, bool *success)
 {
   int result = OK;
-  *success = true;
-
   int wdl = probe_wdl(pos, &result);
-  if (result == FAIL)
-    goto fail;
-
-  // If draw, then dtz = 0.
-  if (wdl == 0)
-    return 0;
-
-  // Check for winning capture or en passant capture as only best move.
-  if (result == ZEROING_IS_BEST)
-    return WdlToDtz[wdl + 2];
-
-  int num = 0;
-
-  // If winning, check for a winning pawn move.
-  if (wdl > 0) {
-    // Generate all quiet moves including promotions.
-    num = TB_generate_quiets(pos, 0);
-
-    for (int m = 0; m < num; m++) {
-      // We check only pawn moves here.
-      if (!TB_move_is_pawn_move(pos, m))
-        continue;
-      if (!TB_do_move(pos, m))
-        continue;
-      // TODO: add alpha/beta bounds to next call
-      int v = -probe_wdl(pos, &result);
-      TB_undo_move(pos, m);
-      if (result == FAIL)
-        goto fail;
-      if (v == wdl)
-        return WdlToDtz[wdl + 2];
-    }
-  }
-
-  // If we are here, we know that the best move is not an ep capture.
-  // In other words, the value of wdl corresponds to the WDL value of
-  // the position without ep rights. It is therefore safe to probe the
-  // DTZ table with the current value of wdl.
-
-  int dtz = probe_dtz_table(pos, wdl, &result);
-  if (result == FAIL)
-    goto fail;
-  if (result != CHANGE_STM)
-    return WdlToDtz[wdl + 2] + ((wdl > 0) ? dtz : -dtz);
-
-  // CHANGE_STM means we need to probe DTZ for the other side to move.
-  int best = INT32_MAX;
-  // If wdl > 0, we have already generated quiet moves.
-  if (wdl < 0) {
-    // If (blessed) loss, the worst case is a losing capture or pawn move
-    // as the "best" move, meaning dtz is -1 or -101.
-    // In case of mate, this will cause -1 to be returned.
-    best = WdlToDtz[wdl + 2];
-    // If wdl < 0, we still have to generate quiet moves.
-    num = TB_generate_quiets(pos, 0);
-  }
-
-  for (int m = 0; m < num; m++) {
-    // We can skip pawn moves. If wdl > 0, we already checked them, and
-    // they were worse than wdl. If wdl < 0, the initial value
-    // of best already takes account of them.
-    if (TB_move_is_pawn_move(pos, m))
-      continue;
-    if (!TB_do_move(pos, m))
-      continue;
-    // FIXME: if wdl > 0, first check if pos is losing.
-    // Alternatively, include a bound in the call.
-    int v = -TB_probe_dtz(pos, success);
-    if (   v == 1
-        && TB_in_check(pos)
-        && TB_no_legal_moves(pos))
-      best = 1;
-    else if (wdl > 0) {
-      if (v > 0 && v + 1 < best)
-        best = v + 1;
-    } else {
-      if (v - 1 < best)
-        best = v - 1;
-    }
-    TB_undo_move(pos, m);
-    if (!success)
-      break;
-  }
-
-  return best;
-
-fail:
-  *success = false;
-  return 0;
+  int dtz =  wdl == 0 || result != OK ? WdlToDtz[wdl + 2]
+           : probe_dtz(pos, wdl, &result);
+  *success = result != FAIL;
+  return dtz;
 }
