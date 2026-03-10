@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2013-2018, 2025 Ronald de Man
+  Copyright (c) 2013-2018, 2025, 2026 Ronald de Man
   This file may be redistributed and/or modified without restrictions.
 */
 
@@ -28,7 +28,6 @@
 #undef max
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #define max(a,b) (((a) > (b)) ? (a) : (b))
-
 
 /* Some platform-specific code for dealing with locks and files */
 
@@ -183,13 +182,15 @@ INLINE uint16_t read_le_u16(const void *p)
 
 enum {
   TB_PIECES = 7,
+  TB_SETS = 5,
   TB_HASHBITS = 12,
   TB_MAX_PIECE = 650,
   TB_MAX_PAWN = 861
 };
 
 enum { WDL = TB_WDL, DTM = TB_DTM, DTZ = TB_DTZ };
-enum { PIECE_ENC, FILE_ENC, RANK_ENC };
+enum { WL_BOTH, WL_WTM, WL_BTM, W_ONLY, L_ONLY };
+enum { LT_PIECE, LT_PIECE_KK, LT_PAWN_FILE, LT_PAWN_RANK };
 enum { FAIL = 0, OK = 1, CHANGE_STM = -1, ZEROING_IS_BEST = 2 };
 
 int TB_NumTables[3];
@@ -203,15 +204,27 @@ struct PairsData {
   const uint8_t *indexTable;
   const uint16_t *sizeTable;
   const uint8_t *data;
-  const uint16_t *offset;
   uint8_t *symLen;
   const uint8_t *symPat;
   uint8_t blockSize;
   uint8_t idxBits;
-  uint8_t minLen;
-  uint8_t constValue[2];
+  uint8_t comprType;
+  union {
+    // Huffman
+    struct {
+      const uint16_t *offset;
+      uint8_t minLen;
+    };
+    // rANS
+    struct RansDecode *rans;
+    // constant
+    uint8_t constValue[2];
+  };
+  // for Huffman
   uint64_t base[]; // must be base[1] in C++
 };
+
+// TODO: include the PairsData struct in the DataTable struct.
 
 struct EncInfo {
   struct PairsData *precomp;
@@ -220,44 +233,67 @@ struct EncInfo {
   uint8_t norm[TB_PIECES];
 };
 
-struct BaseEntry {
-  uint64_t key;
-  const uint8_t *data[3];
-  map_t mapping[3];
-  atomic_bool ready[3];
-  uint8_t num;
-  bool symmetric, hasPawns, hasDtm, hasDtz;
-  union {
-    bool kk_enc;
-    uint8_t pawns[2];
-  };
-  bool dtmLossOnly;
+struct TbTable {
+  struct EncInfo ei;
 };
 
-struct PieceEntry {
-  struct BaseEntry be;
-  struct EncInfo ei[5]; // 2 + 2 + 1
+struct WdlTable {
+  struct EncInfo ei;
+};
+
+struct DtmTable {
+  struct EncInfo ei;
   uint16_t *dtmMap;
   uint16_t dtmMapIdx[2][2];
-  const void *dtzMap;
+  uint8_t dtmFlags;
+};
+
+struct DtzTable {
+  struct EncInfo ei;
+  union {
+    const uint8_t *dtzMap;
+    const uint16_t *dtzMap16;
+  };
   uint16_t dtzMapIdx[4];
   uint8_t dtzFlags;
 };
 
-struct PawnEntry {
-  struct BaseEntry be;
-  struct EncInfo ei[24]; // 4 * 2 + 6 * 2 + 4
-  uint16_t *dtmMap;
-  uint16_t dtmMapIdx[6][2][2];
-  const void *dtzMap;
-  uint16_t dtzMapIdx[4][4];
-  uint8_t dtzFlags[4];
-  bool dtmSwitched;
+static const size_t TABLE_SIZE[3] = {
+  sizeof(struct WdlTable), sizeof(struct DtmTable), sizeof(struct DtzTable)
+};
+
+// If initializing from an old-format file, allocate and initialize
+// all 1/2/4/6/8/12 DataTable structs at once.
+//
+// If initializing from a new-format file, allocate and initialize
+// the DataTable structs on demand.
+
+struct Tbase {
+  const void *data;
+  map_t mapping;
+  uint8_t layout;
+  uint8_t distFormat;
+  bool flipped;
+  struct TbTable *_Atomic table[];
+};
+
+// Per piece combination a struct that keeps track of which TB files
+// have been found and initialized, wdl/dtm/dtz.
+
+struct TbEntry {
+  uint64_t key;
+  bool hasDtm, hasDtz, hasPawns, symmetric; // pack in one byte?
+  union {
+    bool kk_enc;
+    uint8_t pawns[2];
+  };
+  uint8_t num;
+  struct Tbase *_Atomic tbase[3];
 };
 
 struct HashEntry {
   uint64_t key;
-  struct BaseEntry *ptr;
+  struct TbEntry *ptr;
 };
 
 static LOCK_T mutex;
@@ -266,10 +302,9 @@ static int numPaths = 0;
 static char *pathString = NULL;
 static char **paths = NULL;
 
-static int numPiece, numPawn;
+static int numTBs;
 
-static struct PieceEntry *pieceEntry;
-static struct PawnEntry *pawnEntry;
+static struct TbEntry *tbEntry;
 static struct HashEntry tbHash[1 << TB_HASHBITS];
 
 static void init_indices(void);
@@ -326,9 +361,7 @@ static const void *map_tb(const char *name, const char *suffix, map_t *mapping)
 
 static void add_to_hash(void *ptr, uint64_t key)
 {
-  int idx;
-
-  idx = key >> (64 - TB_HASHBITS);
+  int idx = key >> (64 - TB_HASHBITS);
   while (tbHash[idx].ptr)
     idx = (idx + 1) & ((1 << TB_HASHBITS) - 1);
 
@@ -363,62 +396,54 @@ static void detect_tb(char *str)
 
   bool hasPawns = pcs[1] || pcs[9];
 
-  struct BaseEntry *be = hasPawns ? &pawnEntry[numPawn++].be
-                                  : &pieceEntry[numPiece++].be;
-  be->hasPawns = hasPawns;
-  be->key = key;
-  be->symmetric = key == key2;
-  be->num = 0;
+  struct TbEntry *tbe = &tbEntry[numTBs++];
+  tbe->hasPawns = hasPawns;
+  tbe->key = key;
+  tbe->symmetric = key == key2;
+  tbe->num = 0;
   for (int i = 0; i < 16; i++)
-    be->num += pcs[i];
+    tbe->num += pcs[i];
 
   TB_NumTables[WDL]++;
-  TB_NumTables[DTM] += be->hasDtm = test_tb(str, suffix[DTM]);
-  TB_NumTables[DTZ] += be->hasDtz = test_tb(str, suffix[DTZ]);
+  TB_NumTables[DTM] += tbe->hasDtm = test_tb(str, suffix[DTM]);
+  TB_NumTables[DTZ] += tbe->hasDtz = test_tb(str, suffix[DTZ]);
 
-  TB_MaxCardinality[WDL] = max(TB_MaxCardinality[WDL], be->num);
-  if (be->hasDtm)
-    TB_MaxCardinality[DTM] = max(TB_MaxCardinality[DTM], be->num);
-  if (be->hasDtz)
-    TB_MaxCardinality[DTZ] = max(TB_MaxCardinality[DTZ], be->num);
+  TB_MaxCardinality[WDL] = max(TB_MaxCardinality[WDL], tbe->num);
+  if (tbe->hasDtm)
+    TB_MaxCardinality[DTM] = max(TB_MaxCardinality[DTM], tbe->num);
+  if (tbe->hasDtz)
+    TB_MaxCardinality[DTZ] = max(TB_MaxCardinality[DTZ], tbe->num);
 
   for (int type = 0; type < 3; type++)
-    atomic_init(&be->ready[type], false);
+    atomic_init(&tbe->tbase[type], NULL);
 
-  if (!be->hasPawns) {
+  if (!tbe->hasPawns) {
     int j = 0;
     for (int i = 0; i < 16; i++)
       if (pcs[i] == 1) j++;
-    be->kk_enc = j == 2;
+    tbe->kk_enc = j == 2;
   } else {
-    be->pawns[0] = pcs[1]; // number of white pawns
-    be->pawns[1] = pcs[9]; // number of black pawns
+    tbe->pawns[0] = pcs[1]; // number of white pawns
+    tbe->pawns[1] = pcs[9]; // number of black pawns
     if (pcs[9] && (!pcs[1] || pcs[1] > pcs[9]))
-      Swap(be->pawns[0], be->pawns[1]);
+      Swap(tbe->pawns[0], tbe->pawns[1]);
   }
 
-  add_to_hash(be, key);
+  add_to_hash(tbe, key);
   if (key != key2)
-    add_to_hash(be, key2);
+    add_to_hash(tbe, key2);
 }
 
-#define PCE_E(x) ((struct PieceEntry *)(x))
-#define PWN_E(x) ((struct PawnEntry *)(x))
-
-INLINE int num_tables(struct BaseEntry *be, const int type)
+INLINE int num_tables(struct TbEntry *tbe, const int type)
 {
-  return be->hasPawns ? type == DTM ? 6 : 4 : 1;
+  return tbe->hasPawns ? type == DTM ? 6 : 4 : 1;
 }
 
-INLINE struct EncInfo *first_ei(struct BaseEntry *be, const int t)
+static void free_tb_entry(struct TbEntry *tbe)
 {
-  return  be->hasPawns
-        ? &PWN_E(be)->ei[t == WDL ? 0 : t == DTM ? 8 : 20]
-        : &PCE_E(be)->ei[t == WDL ? 0 : t == DTM ? 2 : 4];
-}
-
-static void free_tb_entry(struct BaseEntry *be)
-{
+  (void)tbe;
+  // FIXME
+#if 0
   for (int t = 0; t < 3; t++)
     if (be->ready[t]) {
       unmap_file(be->data[t], be->mapping[t]);
@@ -431,21 +456,24 @@ static void free_tb_entry(struct BaseEntry *be)
       }
       be->ready[t] = false;
     }
+#endif
 }
 
 void TB_free(void)
 {
   TB_init(NULL);
-  free(pieceEntry);
-  free(pawnEntry);
+  free(tbEntry);
 }
 
 void TB_release(void)
 {
+  // FIXME
+#if 0
   for (int i = 0; i < numPiece; i++)
     free_tb_entry((struct BaseEntry *)&pieceEntry[i]);
   for (int i = 0; i < numPawn; i++)
     free_tb_entry((struct BaseEntry *)&pawnEntry[i]);
+#endif
 }
 
 void TB_init(const char *pathList)
@@ -469,7 +497,7 @@ void TB_init(const char *pathList)
 
   for (int i = 0; i < 3; i++)
     TB_NumTables[i] = TB_MaxCardinality[i] = 0;
-  numPiece = numPawn = 0;
+  numTBs = 0;
 
   // if path is an empty string or equals "<empty>", we are done.
   if (!pathList || strlen(pathList) == 0 || !strcmp(pathList, "<empty>"))
@@ -487,10 +515,9 @@ void TB_init(const char *pathList)
 
   LOCK_INIT(mutex);
 
-  if (!pieceEntry) {
-    pieceEntry = malloc(TB_MAX_PIECE * sizeof *pieceEntry);
-    pawnEntry  = malloc(TB_MAX_PAWN  * sizeof *pawnEntry );
-    if (!pieceEntry || !pawnEntry) {
+  if (!tbEntry) {
+    tbEntry = malloc((TB_MAX_PIECE + TB_MAX_PAWN) * sizeof *tbEntry);
+    if (!tbEntry) {
       fprintf(stderr, "Out of memory.\n");
       exit(EXIT_FAILURE);
     }
@@ -810,19 +837,19 @@ static void init_indices(void)
   }
 }
 
-INLINE int leading_pawn(int *p, struct BaseEntry *be, const int enc)
+INLINE int leading_pawn(int *p, struct TbEntry *tbe, const int enc)
 {
-  for (int i = 1; i < be->pawns[0]; i++)
+  for (int i = 1; i < tbe->pawns[0]; i++)
     if (Flap[enc-1][p[0]] > Flap[enc-1][p[i]])
       Swap(p[0], p[i]);
 
-  return enc == FILE_ENC ? FileToFile[p[0] & 7] : (p[0] - 8) >> 3;
+  return enc == LT_PAWN_FILE ? FileToFile[p[0] & 7] : (p[0] - 8) >> 3;
 }
 
-INLINE size_t encode(int *p, struct EncInfo *ei, struct BaseEntry *be,
+INLINE size_t encode(int *p, struct EncInfo *ei, struct TbEntry *tbe,
     const int enc)
 {
-  int n = be->num;
+  int n = tbe->num;
   size_t idx;
   int k;
 
@@ -830,20 +857,20 @@ INLINE size_t encode(int *p, struct EncInfo *ei, struct BaseEntry *be,
     for (int i = 0; i < n; i++)
       p[i] ^= 0x07;
 
-  if (enc == PIECE_ENC) {
+  if (enc == LT_PIECE) {
     if (p[0] & 0x20)
       for (int i = 0; i < n; i++)
         p[i] ^= 0x38;
 
     for (int i = 0; i < n; i++)
       if (OffDiag[p[i]]) {
-        if (OffDiag[p[i]] > 0 && i < (be->kk_enc ? 2 : 3))
+        if (OffDiag[p[i]] > 0 && i < (tbe->kk_enc ? 2 : 3))
           for (int j = 0; j < n; j++)
             p[j] = FlipDiag[p[j]];
         break;
       }
 
-    if (be->kk_enc) {
+    if (tbe->kk_enc) {
       idx = KKIdx[Triangle[p[0]]][p[1]];
       k = 2;
     } else {
@@ -864,20 +891,20 @@ INLINE size_t encode(int *p, struct EncInfo *ei, struct BaseEntry *be,
     }
     idx *= ei->factor[0];
   } else {
-    for (int i = 1; i < be->pawns[0]; i++)
-      for (int j = i + 1; j < be->pawns[0]; j++)
+    for (int i = 1; i < tbe->pawns[0]; i++)
+      for (int j = i + 1; j < tbe->pawns[0]; j++)
         if (PawnTwist[enc-1][p[i]] < PawnTwist[enc-1][p[j]])
           Swap(p[i], p[j]);
 
-    k = be->pawns[0];
+    k = tbe->pawns[0];
     idx = PawnIdx[enc-1][k-1][Flap[enc-1][p[0]]];
     for (int i = 1; i < k; i++)
       idx += Binomial[k-i][PawnTwist[enc-1][p[i]]];
     idx *= ei->factor[0];
 
     // Pawns of other color
-    if (be->pawns[1]) {
-      int t = k + be->pawns[1];
+    if (tbe->pawns[1]) {
+      int t = k + tbe->pawns[1];
       for (int i = k; i < t; i++)
         for (int j = i + 1; j < t; j++)
           if (p[i] > p[j]) Swap(p[i], p[j]);
@@ -915,21 +942,21 @@ INLINE size_t encode(int *p, struct EncInfo *ei, struct BaseEntry *be,
 }
 
 static NOINLINE size_t encode_piece(int *p, struct EncInfo *ei,
-    struct BaseEntry *be)
+    struct TbEntry *tbe)
 {
-  return encode(p, ei, be, PIECE_ENC);
+  return encode(p, ei, tbe, LT_PIECE);
 }
 
 static NOINLINE size_t encode_pawn_f(int *p, struct EncInfo *ei,
-    struct BaseEntry *be)
+    struct TbEntry *tbe)
 {
-  return encode(p, ei, be, FILE_ENC);
+  return encode(p, ei, tbe, LT_PAWN_FILE);
 }
 
 static NOINLINE size_t encode_pawn_r(int *p, struct EncInfo *ei,
-    struct BaseEntry *be)
+    struct TbEntry *tbe)
 {
-  return encode(p, ei, be, RANK_ENC);
+  return encode(p, ei, tbe, LT_PAWN_RANK);
 }
 
 // Count number of placements of k like pieces on n squares
@@ -943,12 +970,12 @@ static size_t subfactor(size_t k, size_t n)
   return f;
 }
 
-static size_t init_enc_info(struct EncInfo *ei, struct BaseEntry *be,
+static size_t init_enc_info(struct EncInfo *ei, struct TbEntry *tbe,
     const uint8_t *tb, int shift, int t, const int enc)
 {
-  bool morePawns = enc != PIECE_ENC && be->pawns[1] > 0;
+  bool morePawns = enc != LT_PIECE && tbe->pawns[1] > 0;
 
-  for (int i = 0; i < be->num; i++) {
+  for (int i = 0; i < tbe->num; i++) {
     ei->pieces[i] = (tb[i + 1 + morePawns] >> shift) & 0x0f;
     ei->norm[i] = 0;
   }
@@ -956,27 +983,27 @@ static size_t init_enc_info(struct EncInfo *ei, struct BaseEntry *be,
   int order = (tb[0] >> shift) & 0x0f;
   int order2 = morePawns ? (tb[1] >> shift) & 0x0f : 0x0f;
 
-  int k = ei->norm[0] =  enc != PIECE_ENC ? be->pawns[0]
-                       : be->kk_enc ? 2 : 3;
+  int k = ei->norm[0] =  enc != LT_PIECE ? tbe->pawns[0]
+                       : tbe->kk_enc ? 2 : 3;
 
   if (morePawns) {
-    ei->norm[k] = be->pawns[1];
+    ei->norm[k] = tbe->pawns[1];
     k += ei->norm[k];
   }
 
-  for (int i = k; i < be->num; i += ei->norm[i])
-    for (int j = i; j < be->num && ei->pieces[j] == ei->pieces[i]; j++)
+  for (int i = k; i < tbe->num; i += ei->norm[i])
+    for (int j = i; j < tbe->num && ei->pieces[j] == ei->pieces[i]; j++)
       ei->norm[i]++;
 
   int n = 64 - k;
   size_t f = 1;
 
-  for (int i = 0; k < be->num || i == order || i == order2; i++) {
+  for (int i = 0; k < tbe->num || i == order || i == order2; i++) {
     if (i == order) {
       ei->factor[0] = f;
-      f *=  enc == FILE_ENC ? PawnFactorFile[ei->norm[0] - 1][t]
-          : enc == RANK_ENC ? PawnFactorRank[ei->norm[0] - 1][t]
-          : be->kk_enc ? 462 : 31332;
+      f *=  enc == LT_PAWN_FILE ? PawnFactorFile[ei->norm[0] - 1][t]
+          : enc == LT_PAWN_RANK ? PawnFactorRank[ei->norm[0] - 1][t]
+          : tbe->kk_enc ? 462 : 31332;
     } else if (i == order2) {
       ei->factor[ei->norm[0]] = f;
       f *= subfactor(ei->norm[ei->norm[0]], 48 - ei->norm[0]);
@@ -991,7 +1018,7 @@ static size_t init_enc_info(struct EncInfo *ei, struct BaseEntry *be,
   return f;
 }
 
-static void calc_symLen(struct PairsData *d, uint32_t s, char *tmp)
+static void calc_symlen(struct PairsData *d, uint32_t s, char *tmp)
 {
   const uint8_t *w = d->symPat + 3 * s;
   uint32_t s2 = (w[2] << 4) | (w[1] >> 4);
@@ -999,8 +1026,8 @@ static void calc_symLen(struct PairsData *d, uint32_t s, char *tmp)
     d->symLen[s] = 0;
   else {
     uint32_t s1 = ((w[1] & 0xf) << 8) | w[0];
-    if (!tmp[s1]) calc_symLen(d, s1, tmp);
-    if (!tmp[s2]) calc_symLen(d, s2, tmp);
+    if (!tmp[s1]) calc_symlen(d, s1, tmp);
+    if (!tmp[s2]) calc_symlen(d, s2, tmp);
     d->symLen[s] = d->symLen[s1] + d->symLen[s2] + 1;
   }
   tmp[s] = 1;
@@ -1049,7 +1076,7 @@ static struct PairsData *setup_pairs(const uint8_t **ptr, size_t tb_size,
   memset(tmp, 0, numSyms);
   for (uint32_t s = 0; s < numSyms; s++)
     if (!tmp[s])
-      calc_symLen(d, s, tmp);
+      calc_symlen(d, s, tmp);
 
   d->base[h - 1] = 0;
   for (int i = h - 2; i >= 0; i--)
@@ -1063,68 +1090,87 @@ static struct PairsData *setup_pairs(const uint8_t **ptr, size_t tb_size,
   return d;
 }
 
-static NOINLINE bool init_table(struct BaseEntry *be, const char *str,
+static NOINLINE struct Tbase *init_tbase(struct TbEntry *tbe, const char *str,
     int type)
 {
-  const uint8_t *data = map_tb(str, suffix[type], &be->mapping[type]);
-  if (!data) return false;
+  map_t mapping;
+  const uint8_t *data = map_tb(str, suffix[type], &mapping);
+  if (!data) return NULL;
 
   if (read_le_u32(data) != magic[type]) {
-    fprintf(stderr, "Corrupted table.\n");
-    unmap_file(data, be->mapping[type]);
-    return false;
+    fprintf(stderr, "Invalid tablebase file.\n");
+    unmap_file(data, mapping);
+    return NULL;
   }
 
-  be->data[type] = data;
+  int num = num_tables(tbe, type);
+  struct Tbase *tbase = malloc(sizeof(struct Tbase) + num * sizeof(void *));
+  tbase->data = data;
+  tbase->mapping = mapping;
+  tbase->layout =  !tbe->hasPawns ? LT_PIECE
+                 : type == DTZ ? LT_PAWN_FILE : LT_PAWN_RANK;
 
   bool split = type != DTZ && (data[4] & 0x01);
   if (type == DTM)
-    be->dtmLossOnly = data[4] & 0x04;
+    tbase->distFormat = (data[4] & 0x04) ? L_ONLY : WL_BOTH;
+  if (type == DTZ)
+    tbase->distFormat = WL_WTM; // FIXME
+  tbase->flipped = false; // FIXME
 
   data += 5;
 
   size_t tb_size[6][2];
-  int num = num_tables(be, type);
-  struct EncInfo *ei = first_ei(be, type);
-  int enc = !be->hasPawns ? PIECE_ENC : type != DTM ? FILE_ENC : RANK_ENC;
+
+  for (int t = 0; t < num; t++)
+    tbase->table[t] = malloc(TABLE_SIZE[type]);
+  if (split)
+    for (int t = 0; t < num; t++)
+      tbase->table[num + t] = malloc(TABLE_SIZE[type]);
+
+  tbase->layout =  !tbe->hasPawns ? LT_PIECE
+                 : type != DTM ? LT_PAWN_FILE : LT_PAWN_RANK;
 
   for (int t = 0; t < num; t++) {
-    tb_size[t][0] = init_enc_info(&ei[t], be, data, 0, t, enc);
-    if (split)
-      tb_size[t][1] = init_enc_info(&ei[num + t], be, data, 4, t, enc);
-    data += be->num + 1 + (be->hasPawns && be->pawns[1]);
+    struct EncInfo *ei = &tbase->table[t]->ei;
+    tb_size[t][0] = init_enc_info(ei, tbe, data, 0, t, tbase->layout);
+    if (split) {
+      ei = &tbase->table[num + t]->ei;
+      tb_size[t][1] = init_enc_info(ei, tbe, data, 4, t, tbase->layout);
+    }
+    data += tbe->num + 1 + (tbe->hasPawns && tbe->pawns[1]);
   }
   data += (uintptr_t)data & 1;
 
   size_t size[6][2][3];
   for (int t = 0; t < num; t++) {
     uint8_t flags;
-    ei[t].precomp = setup_pairs(&data, tb_size[t][0], size[t][0], &flags, type);
+    struct EncInfo *ei = &tbase->table[t]->ei;
+    ei->precomp = setup_pairs(&data, tb_size[t][0], size[t][0], &flags, type);
     if (type == DTZ) {
-      if (!be->hasPawns)
-        PCE_E(be)->dtzFlags = flags;
-      else
-        PWN_E(be)->dtzFlags[t] = flags;
+      struct DtzTable *dtz = (struct DtzTable *)tbase->table[t];
+      dtz->dtzFlags = flags;
     }
-    if (split)
-      ei[num + t].precomp = setup_pairs(&data, tb_size[t][1], size[t][1], &flags, type);
+    if (split) {
+      struct EncInfo *ei = &tbase->table[num + t]->ei;
+      ei[t].precomp = setup_pairs(&data, tb_size[t][1], size[t][1],
+          &flags, type);
+    }
     else if (type != DTZ)
       ei[num + t].precomp = NULL;
   }
 
-  if (type == DTM && !be->dtmLossOnly) {
-    uint16_t *map = (uint16_t *)data;
-    *(be->hasPawns ? &PWN_E(be)->dtmMap : &PCE_E(be)->dtmMap) = map;
-    uint16_t (*mapIdx)[2][2] = be->hasPawns ? &PWN_E(be)->dtmMapIdx[0]
-                                            : &PCE_E(be)->dtmMapIdx;
+  // FIXME: This does not support WL_BOTH.
+  if (type == DTM && tbase->distFormat != L_ONLY) {
     for (int t = 0; t < num; t++) {
+      struct DtmTable *dtm = (struct DtmTable *)tbase->table[t];
+      dtm->dtmMap = (uint16_t *)data;
       for (int i = 0; i < 2; i++) {
-        mapIdx[t][0][i] = (uint16_t *)data + 1 - map;
+        dtm->dtmMapIdx[0][i] = (uint16_t *)data + 1 - dtm->dtmMap;
         data += 2 + 2 * read_le_u16(data);
       }
       if (split) {
         for (int i = 0; i < 2; i++) {
-          mapIdx[t][1][i] = (uint16_t *)data + 1 - map;
+          dtm->dtmMapIdx[1][i] = (uint16_t *)data + 1 - dtm->dtmMap;
           data += 2 + 2 * read_le_u16(data);
         }
       }
@@ -1132,23 +1178,20 @@ static NOINLINE bool init_table(struct BaseEntry *be, const char *str,
   }
 
   if (type == DTZ) {
-    const void *map = data;
-    *(be->hasPawns ? &PWN_E(be)->dtzMap : &PCE_E(be)->dtzMap) = map;
-    uint16_t (*mapIdx)[4] = be->hasPawns ? &PWN_E(be)->dtzMapIdx[0]
-                                         : &PCE_E(be)->dtzMapIdx;
-    uint8_t *flags = be->hasPawns ? &PWN_E(be)->dtzFlags[0]
-                                  : &PCE_E(be)->dtzFlags;
     for (int t = 0; t < num; t++) {
-      if (flags[t] & 2) {
-        if (!(flags[t] & 16)) {
+      struct DtzTable *dtz = (struct DtzTable *)tbase->table[t];
+      if (dtz->dtzFlags & 2) {
+        if (!(dtz->dtzFlags & 16)) {
+          dtz->dtzMap = data;
           for (int i = 0; i < 4; i++) {
-            mapIdx[t][i] = data + 1 - (uint8_t *)map;
+            dtz->dtzMapIdx[i] = data + 1 - dtz->dtzMap;
             data += 1 + data[0];
           }
         } else {
+          dtz->dtzMap16 = (uint16_t *)data;
           data += (uintptr_t)data & 0x01;
           for (int i = 0; i < 4; i++) {
-            mapIdx[t][i] = (uint16_t *)data + 1 - (uint16_t *)map;
+            dtz->dtzMapIdx[i] = (uint16_t *)data + 1 - dtz->dtzMap16;
             data += 2 + 2 * read_le_u16(data);
           }
         }
@@ -1158,34 +1201,42 @@ static NOINLINE bool init_table(struct BaseEntry *be, const char *str,
   }
 
   for (int t = 0; t < num; t++) {
-    ei[t].precomp->indexTable = data;
+    struct EncInfo *ei = &tbase->table[t]->ei;
+    ei->precomp->indexTable = data;
     data += size[t][0][0];
     if (split) {
-      ei[num + t].precomp->indexTable = data;
+      struct EncInfo *ei = &tbase->table[num + t]->ei;
+      ei->precomp->indexTable = data;
       data += size[t][1][0];
     }
   }
 
   for (int t = 0; t < num; t++) {
-    ei[t].precomp->sizeTable = (uint16_t *)data;
+    struct EncInfo *ei = &tbase->table[t]->ei;
+    ei->precomp->sizeTable = (uint16_t *)data;
     data += size[t][0][1];
     if (split) {
-      ei[num + t].precomp->sizeTable = (uint16_t *)data;
+      struct EncInfo *ei = &tbase->table[num + t]->ei;
+      ei->precomp->sizeTable = (uint16_t *)data;
       data += size[t][1][1];
     }
   }
 
   for (int t = 0; t < num; t++) {
     data = (uint8_t *)(((uintptr_t)data + 0x3f) & ~0x3f);
-    ei[t].precomp->data = data;
+    struct EncInfo *ei = &tbase->table[t]->ei;
+    ei->precomp->data = data;
     data += size[t][0][2];
     if (split) {
       data = (uint8_t *)(((uintptr_t)data + 0x3f) & ~0x3f);
-      ei[num + t].precomp->data = data;
+      struct EncInfo *ei = &tbase->table[num + t]->ei;
+      ei->precomp->data = data;
       data += size[t][1][2];
     }
   }
 
+  // FIXME
+#if 0
   if (type == DTM && be->hasPawns) {
     int count[16];
     for (int i = 0; i < 16; i++)
@@ -1195,8 +1246,9 @@ static NOINLINE bool init_table(struct BaseEntry *be, const char *str,
     PWN_E(be)->dtmSwitched =
         TB_material_key_from_counts(count, count + 8) != be->key;
   }
+#endif
 
-  return true;
+  return tbase;
 }
 
 static const uint8_t *decompress_pairs(struct PairsData *d, size_t idx)
@@ -1284,79 +1336,101 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     return 0;
   }
 
-  struct BaseEntry *be = tbHash[hashIdx].ptr;
-  if ((type == DTM && !be->hasDtm) || (type == DTZ && !be->hasDtz)) {
+  struct TbEntry *tbe = tbHash[hashIdx].ptr;
+  if ((type == DTM && !tbe->hasDtm) || (type == DTZ && !tbe->hasDtz)) {
     *result = FAIL;
     return 0;
   }
 
-  // Use double-checked locking to reduce locking overhead
-  if (!atomic_load_explicit(&be->ready[type], memory_order_acquire)) {
+  struct Tbase *tb;
+
+  // Use double-checked locking to reduce locking overhead.
+  if (!(tb = atomic_load_explicit(&tbe->tbase[type], memory_order_acquire))) {
     LOCK(mutex);
-    if (!atomic_load_explicit(&be->ready[type], memory_order_relaxed)) {
+    if (!(tb = atomic_load_explicit(&tbe->tbase[type], memory_order_relaxed))) {
       char str[16], str2[16];
       TB_material_string(pos, str);
-      if (be->key != key) { // KRvKQ -> KQvKR
+      if (tbe->key != key) { // KRvKQ -> KQvKR
         char *s = strchr(str, 'v');
         sprintf(str2, "%sv%.*s", s + 1, (int)(s - str), str);
       }
-      if (!init_table(be, be->key == key ? str : str2, type)) {
-        tbHash[hashIdx].ptr = NULL; // mark as deleted
+      if (!(tb = init_tbase(tbe, tbe->key == key ? str : str2, type))) {
+        tbHash[hashIdx].ptr = NULL; // Mark as deleted.
         *result = FAIL;
         UNLOCK(mutex);
         return 0;
       }
-      atomic_store_explicit(&be->ready[type], true, memory_order_release);
+      atomic_store_explicit(&tbe->tbase[type], tb, memory_order_release);
     }
     UNLOCK(mutex);
   }
 
-  bool bside, flip;
-  if (!be->symmetric) {
-    flip = key != be->key;
-    bside = TB_white_to_move(pos) == flip;
-    if (type == DTM && be->hasPawns && PWN_E(be)->dtmSwitched) {
-      flip = !flip;
-      bside = !bside;
+  if (type == DTM || type == DTZ) {
+    if (   (tb->distFormat == W_ONLY && s <= 0)
+        || (tb->distFormat == L_ONLY && s > 0))
+    {
+      // A 1-ply search is needed.
+      *result = CHANGE_STM;
+      return 0;
     }
-  } else {
-    flip = !TB_white_to_move(pos);
-    bside = false;
   }
 
-  struct EncInfo *ei = first_ei(be, type);
+  bool btm_side, flip;
+  if (!tbe->symmetric) {
+    flip = (key != tbe->key) != tb->flipped;  // Flip colours?
+    btm_side = TB_white_to_move(pos) == flip; // Probe btm?
+  } else {
+    // Probe the wtm side for symmetric tables.
+    flip = !TB_white_to_move(pos);
+    btm_side = false;
+  }
+
+  // FIXME: filed-based pawnful DTZ may have different WTM/BTM per file.
+  if (type == DTM) { // || type == DTZ)
+    if (   (tb->distFormat == WL_WTM && btm_side)
+        || (tb->distFormat == WL_BTM && !btm_side))
+    {
+      *result = CHANGE_STM;
+      return 0;
+    }
+  }
+
   int p[TB_PIECES];
   size_t idx;
   int t = 0;
-  uint8_t flags;
+  struct EncInfo *ei;
 
-  if (!be->hasPawns) {
+  if (!tbe->hasPawns) {
+    t = (type != DTZ && (type == WDL || tb->distFormat != WL_BTM)) ? btm_side : 0;
     if (type == DTZ) {
-      flags = PCE_E(be)->dtzFlags;
-      if ((flags & 1) != bside && !be->symmetric) {
+      struct DtzTable *dtz = (struct DtzTable *)&tb->table[t];
+      if ((dtz->dtzFlags & 1) != btm_side && !tbe->symmetric) {
         *result = CHANGE_STM;
         return 0;
       }
     }
-    ei = type != DTZ ? &ei[bside] : ei;
+    ei = &tb->table[t]->ei;
     TB_list_squares(pos, ei->pieces, flip, p);
-    idx = encode_piece(p, ei, be);
+    idx = encode_piece(p, ei, tbe);
   } else {
+    ei = &tb->table[0]->ei;
     TB_list_squares(pos, ei->pieces, flip, p);
-    t = leading_pawn(p, be, type != DTM ? FILE_ENC : RANK_ENC);
+    t = leading_pawn(p, tbe, tb->layout);
     if (type == DTZ) {
-      flags = PWN_E(be)->dtzFlags[t];
-      if ((flags & 1) != bside && !be->symmetric) {
+      struct DtzTable *dtz = (struct DtzTable *)&tb->table[t];
+      if ((dtz->dtzFlags & 1) != btm_side && !tbe->symmetric) {
         *result = CHANGE_STM;
         return 0;
       }
     }
-    ei =  type == WDL ? &ei[t + 4 * bside]
-        : type == DTM ? &ei[t + 6 * bside] : &ei[t];
+    // FIXME
+    t = type == WDL ? t + 4 * btm_side : type == DTM ? t + 6 * btm_side : t;
+    ei = &tb->table[t]->ei;
     TB_list_squares(pos, ei->pieces, flip, p);
     // Bring the leading pawn back to the front.
-    leading_pawn(p, be, type != DTM ? FILE_ENC : RANK_ENC);
-    idx = type != DTM ? encode_pawn_f(p, ei, be) : encode_pawn_r(p, ei, be);
+    leading_pawn(p, tbe, tb->layout);
+    // FIXME
+    idx = type != DTM ? encode_pawn_f(p, ei, tbe) : encode_pawn_r(p, ei, tbe);
   }
 
   TB_ProbeCount[type]++;
@@ -1369,23 +1443,21 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
   int v = w[0] + ((w[1] & 0x0f) << 8);
 
   if (type == DTM) {
-    if (!be->dtmLossOnly)
-      v =  from_le_u16(be->hasPawns
-         ? PWN_E(be)->dtmMap[PWN_E(be)->dtmMapIdx[t][bside][s] + v]
-         : PCE_E(be)->dtmMap[PCE_E(be)->dtmMapIdx[bside][s] + v]);
-  } else {
-    if (flags & 2) {
+    struct DtmTable *dtm = (struct DtmTable *)tb->table[t];
+    if (tb->distFormat != W_ONLY && tb->distFormat != L_ONLY)
+      v = from_le_u16(dtm->dtmMap[dtm->dtmMapIdx[btm_side][s] + v]);
+  }
+ 
+  if (type == DTZ) {
+    struct DtzTable *dtz = (struct DtzTable *)tb->table[t];
+    if (dtz->dtzFlags & 2) {
       int m = WdlToMap[s + 2];
-      if (!(flags & 16))
-        v =  be->hasPawns
-           ? ((uint8_t *)PWN_E(be)->dtzMap)[PWN_E(be)->dtzMapIdx[t][m] + v]
-           : ((uint8_t *)PCE_E(be)->dtzMap)[PCE_E(be)->dtzMapIdx[m] + v];
+      if (!(dtz->dtzFlags & 16))
+        v = dtz->dtzMap[dtz->dtzMapIdx[m] + v];
       else
-        v =  from_le_u16(be->hasPawns
-           ? ((uint16_t *)PWN_E(be)->dtzMap)[PWN_E(be)->dtzMapIdx[t][m] + v]
-           : ((uint16_t *)PCE_E(be)->dtzMap)[PCE_E(be)->dtzMapIdx[m] + v]);
+        v = dtz->dtzMap16[dtz->dtzMapIdx[m] + v];
     }
-    if (!(flags & PAFlags[s + 2]) || (s & 1))
+    if (!(dtz->dtzFlags & PAFlags[s + 2]) || (s & 1))
       v *= 2;
   }
 
@@ -1737,6 +1809,8 @@ int TB_probe_dtz(TB_Position *pos, bool *success)
       continue;
     if (!TB_do_move(pos, m))
       continue;
+    // FIXME: if wdl > 0, first check if pos is losing.
+    // Alternatively, include a bound in the call.
     int v = -TB_probe_dtz(pos, success);
     if (   v == 1
         && TB_in_check(pos)
