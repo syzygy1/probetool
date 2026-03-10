@@ -837,17 +837,17 @@ static void init_indices(void)
   }
 }
 
-INLINE int leading_pawn(int *p, struct TbEntry *tbe, const int enc)
+INLINE int leading_pawn(int *p, struct TbEntry *tbe, const int lt)
 {
   for (int i = 1; i < tbe->pawns[0]; i++)
-    if (Flap[enc-1][p[0]] > Flap[enc-1][p[i]])
+    if (Flap[lt - LT_PAWN_FILE][p[0]] > Flap[lt - LT_PAWN_FILE][p[i]])
       Swap(p[0], p[i]);
 
-  return enc == LT_PAWN_FILE ? FileToFile[p[0] & 7] : (p[0] - 8) >> 3;
+  return lt == LT_PAWN_FILE ? FileToFile[p[0] & 7] : (p[0] - 8) >> 3;
 }
 
 INLINE size_t encode(int *p, struct EncInfo *ei, struct TbEntry *tbe,
-    const int enc)
+    const int lt)
 {
   int n = tbe->num;
   size_t idx;
@@ -857,7 +857,7 @@ INLINE size_t encode(int *p, struct EncInfo *ei, struct TbEntry *tbe,
     for (int i = 0; i < n; i++)
       p[i] ^= 0x07;
 
-  if (enc == LT_PIECE) {
+  if (lt == LT_PIECE) {
     if (p[0] & 0x20)
       for (int i = 0; i < n; i++)
         p[i] ^= 0x38;
@@ -891,15 +891,16 @@ INLINE size_t encode(int *p, struct EncInfo *ei, struct TbEntry *tbe,
     }
     idx *= ei->factor[0];
   } else {
+    const int enc = lt - LT_PAWN_FILE;
     for (int i = 1; i < tbe->pawns[0]; i++)
       for (int j = i + 1; j < tbe->pawns[0]; j++)
-        if (PawnTwist[enc-1][p[i]] < PawnTwist[enc-1][p[j]])
+        if (PawnTwist[enc][p[i]] < PawnTwist[enc][p[j]])
           Swap(p[i], p[j]);
 
     k = tbe->pawns[0];
-    idx = PawnIdx[enc-1][k-1][Flap[enc-1][p[0]]];
+    idx = PawnIdx[enc][k - 1][Flap[enc][p[0]]];
     for (int i = 1; i < k; i++)
-      idx += Binomial[k-i][PawnTwist[enc-1][p[i]]];
+      idx += Binomial[k-i][PawnTwist[enc][p[i]]];
     idx *= ei->factor[0];
 
     // Pawns of other color
@@ -971,9 +972,9 @@ static size_t subfactor(size_t k, size_t n)
 }
 
 static size_t init_enc_info(struct EncInfo *ei, struct TbEntry *tbe,
-    const uint8_t *tb, int shift, int t, const int enc)
+    const uint8_t *tb, int shift, int t, const int lt)
 {
-  bool morePawns = enc != LT_PIECE && tbe->pawns[1] > 0;
+  bool morePawns = lt != LT_PIECE && tbe->pawns[1] > 0;
 
   for (int i = 0; i < tbe->num; i++) {
     ei->pieces[i] = (tb[i + 1 + morePawns] >> shift) & 0x0f;
@@ -983,7 +984,7 @@ static size_t init_enc_info(struct EncInfo *ei, struct TbEntry *tbe,
   int order = (tb[0] >> shift) & 0x0f;
   int order2 = morePawns ? (tb[1] >> shift) & 0x0f : 0x0f;
 
-  int k = ei->norm[0] =  enc != LT_PIECE ? tbe->pawns[0]
+  int k = ei->norm[0] =  lt != LT_PIECE ? tbe->pawns[0]
                        : tbe->kk_enc ? 2 : 3;
 
   if (morePawns) {
@@ -1001,8 +1002,8 @@ static size_t init_enc_info(struct EncInfo *ei, struct TbEntry *tbe,
   for (int i = 0; k < tbe->num || i == order || i == order2; i++) {
     if (i == order) {
       ei->factor[0] = f;
-      f *=  enc == LT_PAWN_FILE ? PawnFactorFile[ei->norm[0] - 1][t]
-          : enc == LT_PAWN_RANK ? PawnFactorRank[ei->norm[0] - 1][t]
+      f *=  lt == LT_PAWN_FILE ? PawnFactorFile[ei->norm[0] - 1][t]
+          : lt == LT_PAWN_RANK ? PawnFactorRank[ei->norm[0] - 1][t]
           : tbe->kk_enc ? 462 : 31332;
     } else if (i == order2) {
       ei->factor[ei->norm[0]] = f;
@@ -1606,8 +1607,8 @@ int TB_probe_wdl(TB_Position *pos, bool *success)
 
 static int probe_dtm_win(TB_Position *pos, int alpha, int beta, int *result);
 
-// Probe a position known to lose by probing the DTM table and looking
-// at captures. Losing DTM values are negative -> we want to minimize them.
+// Probe a position known to lose.
+// Losing DTM values are negative -> we want to minimize them.
 static int probe_dtm_loss(TB_Position *pos, int alpha, int beta, int *result)
 {
   bool legalCaps = false, legalEpCaps = false;
@@ -1618,16 +1619,14 @@ static int probe_dtm_loss(TB_Position *pos, int alpha, int beta, int *result)
     if (!TB_do_move(pos, m))
       continue;
     v = -probe_dtm_win(pos, max(1, -beta), -alpha, result);
+    beta = min(beta, v);
     TB_undo_move(pos, m);
     if (TB_move_is_ep(pos, m))
       legalEpCaps = true;
     else
       legalCaps = true;
-    beta = min(beta, v);
-    if (beta <= alpha)
+    if (beta <= alpha || *result == FAIL)
       return beta;
-    if (*result == FAIL)
-      return 0;
   }
 
   // If there are en passant captures, the position without ep rights may
@@ -1642,20 +1641,70 @@ static int probe_dtm_loss(TB_Position *pos, int alpha, int beta, int *result)
 
 no_stalemate:
   v = -probe_dtm_table(pos, false, result);
-  return min(beta, v);
+  if (*result != CHANGE_STM)
+    return min(beta, v);
+
+  *result = OK;
+  if (!legalEpCaps || legalCaps)
+    num = TB_generate_quiets(pos, 0);
+  for (int m = 0; m < num; m++) {
+    if (!TB_do_move(pos, m))
+      continue;
+    v = -probe_dtm_win(pos, max(1, -beta), -alpha, result);
+    beta = min(beta, v);
+    TB_undo_move(pos, m);
+    if (beta <= alpha || *result == FAIL)
+      return beta;
+  }
+
+  return beta;
 }
 
-// Probe a position known to win by probing the DTM table and looking
-// at captures. Winning DTM values are positive -> we want to minimize them.
+// Probe a position known to win.
+// Winning DTM values are positive -> we want to minimize them.
 static int probe_dtm_win(TB_Position *pos, int alpha, int beta, int *result)
 {
   if (beta <= alpha)
     return beta;
 
-  int num = TB_generate_captures(pos);
-  num = TB_generate_quiets(pos, num);
+  bool legalCaps = false, legalEpCaps = false;
 
-  // Perform a 1-ply search
+  int v, num = TB_generate_captures(pos);
+
+  for (int m = 0; m < num; m++) {
+    if (!TB_do_move(pos, m))
+      continue;
+    if (probe_ab(pos, -1, 0, result) < 0 && *result != FAIL) {
+      v = 1 - probe_dtm_loss(pos, 1 - beta, 1 - alpha, result);
+      beta = min(beta, v);
+    }
+    TB_undo_move(pos, m);
+    if (TB_move_is_ep(pos, m))
+      legalEpCaps = true;
+    else
+      legalCaps = true;
+    if (beta <= alpha || *result == FAIL)
+      return beta;
+  }
+
+  // If there are en passant captures, the position without ep rights may
+  // be a draw by stalemate. If it is, we must avoid probing the DTM table.
+  if (legalEpCaps && !legalCaps) {
+    num = TB_generate_quiets(pos, 0);
+    for (int m = 0; m < num; m++)
+      if (TB_move_is_legal(pos, m))
+        goto no_stalemate;
+    return beta;
+  }
+
+no_stalemate:
+  v = -probe_dtm_table(pos, true, result);
+  if (*result != CHANGE_STM)
+    return min(beta, v);
+
+  *result = OK;
+  if (!legalEpCaps || legalCaps)
+    num = TB_generate_quiets(pos, 0);
   for (int m = 0; m < num; m++) {
     if (!TB_do_move(pos, m))
       continue;
