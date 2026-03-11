@@ -1179,17 +1179,18 @@ static NOINLINE struct Tbase *init_tbase(struct TbEntry *tbe, const char *str,
   }
 
   if (type == DTZ) {
+    const void *map = data;
     for (int t = 0; t < num; t++) {
       struct DtzTable *dtz = (struct DtzTable *)tbase->table[t];
       if (dtz->dtzFlags & 2) {
         if (!(dtz->dtzFlags & 16)) {
-          dtz->dtzMap = data;
+          dtz->dtzMap = map;
           for (int i = 0; i < 4; i++) {
             dtz->dtzMapIdx[i] = data + 1 - dtz->dtzMap;
             data += 1 + data[0];
           }
         } else {
-          dtz->dtzMap16 = (uint16_t *)data;
+          dtz->dtzMap16 = map;
           data += (uintptr_t)data & 0x01;
           for (int i = 0; i < 4; i++) {
             dtz->dtzMapIdx[i] = (uint16_t *)data + 1 - dtz->dtzMap16;
@@ -1404,7 +1405,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
   if (!tbe->hasPawns) {
     t = (type != DTZ && (type == WDL || tb->distFormat != WL_BTM)) ? btm_side : 0;
     if (type == DTZ) {
-      struct DtzTable *dtz = (struct DtzTable *)&tb->table[t];
+      struct DtzTable *dtz = (struct DtzTable *)tb->table[t];
       if ((dtz->dtzFlags & 1) != btm_side && !tbe->symmetric) {
         *result = CHANGE_STM;
         return 0;
@@ -1418,7 +1419,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     TB_list_squares(pos, ei->pieces, flip, p);
     t = leading_pawn(p, tbe, tb->layout);
     if (type == DTZ) {
-      struct DtzTable *dtz = (struct DtzTable *)&tb->table[t];
+      struct DtzTable *dtz = (struct DtzTable *)tb->table[t];
       if ((dtz->dtzFlags & 1) != btm_side && !tbe->symmetric) {
         *result = CHANGE_STM;
         return 0;
