@@ -29,6 +29,7 @@
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #define max(a,b) (((a) > (b)) ? (a) : (b))
 
+
 /* Some platform-specific code for dealing with locks and files */
 
 #ifdef _WIN32
@@ -144,6 +145,11 @@ INLINE bool is_little_endian(void)
   return *(uint8_t *)&num == 1;
 }
 
+INLINE uint64_t from_le_u64(uint64_t v)
+{
+  return is_little_endian() ? v : __builtin_bswap64(v);
+}
+
 INLINE uint32_t from_le_u32(uint32_t v)
 {
   return is_little_endian() ? v : __builtin_bswap32(v);
@@ -164,6 +170,13 @@ INLINE uint32_t from_be_u32(uint32_t v)
   return is_little_endian() ? __builtin_bswap32(v) : v;
 }
 
+INLINE uint32_t read_le_u64(const void *p)
+{
+  uint64_t  v;
+  memcpy(&v, p, sizeof v);
+  return from_le_u64(v);
+}
+
 INLINE uint32_t read_le_u32(const void *p)
 {
   uint32_t  v;
@@ -178,10 +191,186 @@ INLINE uint16_t read_le_u16(const void *p)
   return from_le_u16(v);
 }
 
+
+/* rANS decompression code */
+
+struct RansEntry {
+  uint16_t alias_div;
+  uint16_t start;
+};
+
+struct RansDecode {
+  struct RansEntry entry[4096];
+  uint16_t freq[4096];
+};
+
+INLINE void rans_dec_init(uint64_t *r, const uint8_t **p,
+    const uint8_t *const end)
+{
+  while (read_le_u32(*p) == 0 && *p + 8 < end)
+    *p += 4;
+  *r = read_le_u64(*p);
+  *p += 8;
+}
+
+INLINE uint16_t rans_dec_get(uint64_t *r, struct RansDecode *d)
+{
+  uint64_t x = *r;
+
+  // Figure out symbol via alias table.
+  int s = (x >> 4) & 4095; // bucket id
+  uint16_t remainder = x & 15;
+  if (remainder >= (d->entry[s].alias_div & 15)) {
+    // switch to alias symbol
+    remainder += d->entry[s].start; // can wrap around by design
+    s = d->entry[s].alias_div >> 4;
+  }
+
+  // Update state.
+  uint16_t freq = d->freq[s];
+  *r = freq * (x >> 16) + remainder;
+
+  return s;
+}
+
+INLINE void rans_dec_renorm(uint64_t *r, const uint8_t **p)
+{
+  uint64_t x = *r;
+  // Branchless renormalization is a win.
+  int64_t s = x < (1ULL << 31);
+  uint64_t tx = x;
+  tx = (tx << 32) | (uint64_t)read_le_u32(*p);
+  *p += s << 2;
+  x = (-s & (tx - x)) + x;
+  *r = x;
+}
+
+// Based on https://github.com/rygorous/ryg_rans but with a more compact
+// alias data structure.
+static void make_alias_table(struct RansDecode *d)
+{
+  uint32_t sum = 1u << 16;
+  uint16_t tgt_sum = sum / 4096;
+
+  uint16_t remaining[4096];
+  uint16_t alias[4096];
+  uint8_t divider[4096];
+  for (int i = 0; i < 4096; i++) {
+    remaining[i] = d->freq[i];
+    divider[i] = tgt_sum;
+    alias[i] = i;
+  }
+
+  int cur_large = 0, cur_small = 0;
+  for (;;) {
+    while (cur_large < 4096 && remaining[cur_large] <= tgt_sum)
+      cur_large++;
+    if (cur_large == 4096) break;
+    while (remaining[cur_small] >= tgt_sum)
+      cur_small = (cur_small + 1) & 4095;
+    alias[cur_small] = cur_large;
+    divider[cur_small] = remaining[cur_small];
+    remaining[cur_large] -= tgt_sum - remaining[cur_small];
+    remaining[cur_small] = tgt_sum;
+  }
+
+  uint16_t assigned[4096];
+  for (int b = 0; b < 4096; b++) {
+    assigned[b] = divider[b];
+    d->entry[b].alias_div = (alias[b] << 4) | (divider[b] & 15);
+  }
+  for (int b = 0; b < 4096; b++) {
+    int s = alias[b];
+    d->entry[b].start = s != b ? assigned[s] - divider[b] : 0;
+    assigned[s] += tgt_sum - divider[b];
+  }
+
+  // sanity check
+  for (int i = 0; i < 4096; i++)
+    assert(assigned[i] == d->freq[i]);
+}
+
+// Decode value v in the range 0 <= v < range
+INLINE uint32_t rans_dec_val_uni(uint64_t *r, uint32_t v_min, uint32_t v_max)
+{
+  if (v_min == v_max)
+    return v_min;
+  uint32_t range = v_max - v_min + 1;
+
+  uint64_t x = *r;
+  uint32_t w = x & 0xffff;
+
+  uint32_t v = (w * range + range - 1) >> 16;
+  uint32_t cum_freq = (v << 16) / range;
+  uint32_t freq = ((v + 1) << 16) / range - cum_freq;
+  assert(cum_freq <= w && w < cum_freq + freq);
+  *r = freq * (x >> 16) + (w - cum_freq);
+
+  return v + v_min;
+}
+
+INLINE uint16_t rans_dec_val_top(uint64_t *r, uint32_t v_min, uint32_t v_max,
+    uint32_t f)
+{
+  if (v_min == v_max)
+    return v_min;
+
+  uint64_t x = *r;
+
+  uint32_t w = x & 0xffff;
+  uint32_t v = v_min + min(w / f, v_max - v_min);
+  uint32_t cum_freq = (v - v_min) * f;
+  uint32_t freq = v == v_max ? 65536 - cum_freq : f;
+  assert(cum_freq <= w && w < cum_freq + freq);
+  *r = freq * (x >> 16) + (w - cum_freq);
+
+  return v;
+}
+
+// Decompress a table of up to 4095 symbol frequencies.
+static const uint8_t *read_freq_table(struct RansDecode *d, int *num_syms,
+    const uint8_t *p)
+{
+  uint64_t rans;
+
+  rans_dec_init(&rans, &p, p + sizeof(uint64_t));
+  int num = rans_dec_val_uni(&rans, 2, 4095);
+  *num_syms = num;
+  rans_dec_renorm(&rans, &p);
+  d->freq[0] = rans_dec_val_uni(&rans, 0,
+      (1 << 16) - ((1 << 16) + num - 1) / num);
+  for (int s = 1; s < num; s++) {
+    rans_dec_renorm(&rans, &p);
+    d->freq[s] = rans_dec_val_top(&rans, 1, d->freq[s - 1], 1);
+  }
+  int R = 1 << 16;
+  for (int s = 0; s < num; s++) {
+    int P = s > 0 ? d->freq[s - 1] : INT32_MAX;
+    if (d->freq[s] > d->freq[s + 1] && s < num - 1) {
+      d->freq[s] = min(R, P) - d->freq[s];
+      R -= d->freq[s];
+      continue;
+    }
+    rans_dec_renorm(&rans, &p);
+    int v_max = min(R, P);
+    int v_min = max((R + num - s - 1) / (num - s), v_max - d->freq[s]);
+    if (v_max * (v_max - v_min + 1) >= (num - s))
+      d->freq[s] = rans_dec_val_uni(&rans, v_min, v_max);
+    else {
+      d->freq[s] = rans_dec_val_top(&rans, v_min, v_max,
+          (v_max << 16) / (num - s));
+    }
+    R -= d->freq[s];
+  }
+
+  return p;
+}
+
+
 /* TB initialization and probing code */
 
 enum {
-  TB_PIECES = 7,
+  TB_PIECES = 8,
   TB_SETS = 5,
   TB_HASHBITS = 12,
   TB_MAX_PIECE = 650,
@@ -190,7 +379,7 @@ enum {
 
 enum { WDL = TB_WDL, DTM = TB_DTM, DTZ = TB_DTZ };
 enum { WL_BOTH, WL_WTM, WL_BTM, W_ONLY, L_ONLY };
-enum { LT_PIECE, LT_PIECE_KK, LT_PAWN_FILE, LT_PAWN_RANK };
+enum { LT_PIECE = 0, LT_PIECE_K, LT_PIECE_KK, LT_PAWN_FILE, LT_PAWN_RANK };
 enum { FAIL = 0, OK = 1, CHANGE_STM = -1, ZEROING_IS_BEST = 2 };
 
 int TB_NumTables[3];
@@ -199,6 +388,9 @@ uint64_t TB_ProbeCount[3];
 
 static const char *suffix[] = { ".rtbw", ".rtbm", ".rtbz" };
 static uint32_t magic[] = { 0x5d23e871, 0x88ac504b, 0xa50c66d7 };
+static uint32_t magic2[] = { 0x9ca55208, 0xd895e4a4, 0xeaf9b743 };
+
+enum { STARTBITS = 8 };
 
 struct PairsData {
   const uint8_t *indexTable;
@@ -214,6 +406,7 @@ struct PairsData {
     struct {
       const uint16_t *offset;
       uint8_t minLen;
+      uint8_t start[1 << STARTBITS];
     };
     // rANS
     struct RansDecode *rans;
@@ -243,8 +436,8 @@ struct WdlTable {
 
 struct DtmTable {
   struct EncInfo ei;
-  uint16_t *dtmMap;
-  uint16_t dtmMapIdx[2][2];
+  const uint16_t *dtmMap;
+  uint16_t dtmMapIdx[2];
   uint8_t dtmFlags;
 };
 
@@ -262,11 +455,11 @@ static const size_t TABLE_SIZE[3] = {
   sizeof(struct WdlTable), sizeof(struct DtmTable), sizeof(struct DtzTable)
 };
 
-// If initializing from an old-format file, allocate and initialize
-// all 1/2/4/6/8/12 DataTable structs at once.
+// For an old-format file, we allocate and initialize all 1/2/4/6/8/12
+// TbTable structs at once.
 //
-// If initializing from a new-format file, allocate and initialize
-// the DataTable structs on demand.
+// For a new-format file, we allocate and initialize the TbTable structs
+// on demand.
 
 struct Tbase {
   const void *data;
@@ -274,6 +467,7 @@ struct Tbase {
   uint8_t layout;
   uint8_t distFormat;
   bool flipped;
+  uint8_t offset;
   struct TbTable *_Atomic table[];
 };
 
@@ -288,6 +482,7 @@ struct TbEntry {
     uint8_t pawns[2];
   };
   uint8_t num;
+  uint8_t pt[TB_PIECES];
   struct Tbase *_Atomic tbase[3];
 };
 
@@ -396,52 +591,52 @@ static void detect_tb(char *str)
 
   bool hasPawns = pcs[1] || pcs[9];
 
-  struct TbEntry *tbe = &tbEntry[numTBs++];
-  tbe->hasPawns = hasPawns;
-  tbe->key = key;
-  tbe->symmetric = key == key2;
-  tbe->num = 0;
+  struct TbEntry *entry = &tbEntry[numTBs++];
+  entry->hasPawns = hasPawns;
+  entry->key = key;
+  entry->symmetric = key == key2;
+  entry->num = 0;
   for (int i = 0; i < 16; i++)
-    tbe->num += pcs[i];
+    entry->num += pcs[i];
 
   TB_NumTables[WDL]++;
-  TB_NumTables[DTM] += tbe->hasDtm = test_tb(str, suffix[DTM]);
-  TB_NumTables[DTZ] += tbe->hasDtz = test_tb(str, suffix[DTZ]);
+  TB_NumTables[DTM] += entry->hasDtm = test_tb(str, suffix[DTM]);
+  TB_NumTables[DTZ] += entry->hasDtz = test_tb(str, suffix[DTZ]);
 
-  TB_MaxCardinality[WDL] = max(TB_MaxCardinality[WDL], tbe->num);
-  if (tbe->hasDtm)
-    TB_MaxCardinality[DTM] = max(TB_MaxCardinality[DTM], tbe->num);
-  if (tbe->hasDtz)
-    TB_MaxCardinality[DTZ] = max(TB_MaxCardinality[DTZ], tbe->num);
+  TB_MaxCardinality[WDL] = max(TB_MaxCardinality[WDL], entry->num);
+  if (entry->hasDtm)
+    TB_MaxCardinality[DTM] = max(TB_MaxCardinality[DTM], entry->num);
+  if (entry->hasDtz)
+    TB_MaxCardinality[DTZ] = max(TB_MaxCardinality[DTZ], entry->num);
 
   for (int type = 0; type < 3; type++)
-    atomic_init(&tbe->tbase[type], NULL);
+    atomic_init(&entry->tbase[type], NULL);
 
-  if (!tbe->hasPawns) {
+  if (!entry->hasPawns) {
     int j = 0;
     for (int i = 0; i < 16; i++)
       if (pcs[i] == 1) j++;
-    tbe->kk_enc = j == 2;
+    entry->kk_enc = j == 2;
   } else {
-    tbe->pawns[0] = pcs[1]; // number of white pawns
-    tbe->pawns[1] = pcs[9]; // number of black pawns
+    entry->pawns[0] = pcs[1]; // number of white pawns
+    entry->pawns[1] = pcs[9]; // number of black pawns
     if (pcs[9] && (!pcs[1] || pcs[1] > pcs[9]))
-      Swap(tbe->pawns[0], tbe->pawns[1]);
+      Swap(entry->pawns[0], entry->pawns[1]);
   }
 
-  add_to_hash(tbe, key);
+  add_to_hash(entry, key);
   if (key != key2)
-    add_to_hash(tbe, key2);
+    add_to_hash(entry, key2);
 }
 
-INLINE int num_tables(struct TbEntry *tbe, const int type)
+INLINE int num_tables(struct TbEntry *entry, const int type)
 {
-  return tbe->hasPawns ? type == DTM ? 6 : 4 : 1;
+  return entry->hasPawns ? type == DTM ? 6 : 4 : 1;
 }
 
-static void free_tb_entry(struct TbEntry *tbe)
+static void free_tb_entry(struct TbEntry *entry)
 {
-  (void)tbe;
+  (void)entry;
   // FIXME
 #if 0
   for (int t = 0; t < 3; t++)
@@ -801,6 +996,14 @@ static size_t PawnIdx[2][6][24];
 static size_t PawnFactorFile[6][4];
 static size_t PawnFactorRank[6][6];
 
+static uint8_t MirrorMask[64];
+static int16_t KKMap[64][64];
+
+INLINE uint64_t bit(int sq)
+{
+  return 1ULL << sq;
+}
+
 static void init_indices(void)
 {
   int i, j;
@@ -835,21 +1038,40 @@ static void init_indices(void)
       }
     }
   }
+
+  const uint64_t A1D1D4 = 0x080c0e0full;
+  const uint64_t A1D4   = 0x08040201ull;
+  const uint64_t LOWER  = 0x80c0e0f0f8fcfeffull;
+
+  for (int s = 0; s < 64; s++)
+    MirrorMask[s] = ((s & 0x04) ? 0x07 : 0x00) | ((s & 0x20) ? 0x38 : 0x00);
+
+  for (int i = 0; i < 64; i++)
+    for (int j = 0; j < 64; j++) {
+      int s1 = i ^ MirrorMask[i];
+      int s2 = j ^ MirrorMask[i];
+      if (!(bit(s1) & A1D1D4) || ((bit(s1) & A1D4) && !(bit(s2) & LOWER))) {
+//        FlipTest[i][j] = true;
+        s1 = FlipDiag[s1];
+        s2 = FlipDiag[s2];
+      }
+      KKMap[i][j] = KKIdx[Triangle[s1]][s2];
+    }
 }
 
-INLINE int leading_pawn(int *p, struct TbEntry *tbe, const int lt)
+INLINE int leading_pawn(int *p, struct TbEntry *entry, const int lt)
 {
-  for (int i = 1; i < tbe->pawns[0]; i++)
+  for (int i = 1; i < entry->pawns[0]; i++)
     if (Flap[lt - LT_PAWN_FILE][p[0]] > Flap[lt - LT_PAWN_FILE][p[i]])
       Swap(p[0], p[i]);
 
   return lt == LT_PAWN_FILE ? FileToFile[p[0] & 7] : (p[0] - 8) >> 3;
 }
 
-INLINE size_t encode(int *p, struct EncInfo *ei, struct TbEntry *tbe,
+INLINE size_t encode(int *p, struct EncInfo *ei, struct TbEntry *entry,
     const int lt)
 {
-  int n = tbe->num;
+  int n = entry->num;
   size_t idx;
   int k;
 
@@ -864,13 +1086,13 @@ INLINE size_t encode(int *p, struct EncInfo *ei, struct TbEntry *tbe,
 
     for (int i = 0; i < n; i++)
       if (OffDiag[p[i]]) {
-        if (OffDiag[p[i]] > 0 && i < (tbe->kk_enc ? 2 : 3))
+        if (OffDiag[p[i]] > 0 && i < (entry->kk_enc ? 2 : 3))
           for (int j = 0; j < n; j++)
             p[j] = FlipDiag[p[j]];
         break;
       }
 
-    if (tbe->kk_enc) {
+    if (entry->kk_enc) {
       idx = KKIdx[Triangle[p[0]]][p[1]];
       k = 2;
     } else {
@@ -892,20 +1114,20 @@ INLINE size_t encode(int *p, struct EncInfo *ei, struct TbEntry *tbe,
     idx *= ei->factor[0];
   } else {
     const int enc = lt - LT_PAWN_FILE;
-    for (int i = 1; i < tbe->pawns[0]; i++)
-      for (int j = i + 1; j < tbe->pawns[0]; j++)
+    for (int i = 1; i < entry->pawns[0]; i++)
+      for (int j = i + 1; j < entry->pawns[0]; j++)
         if (PawnTwist[enc][p[i]] < PawnTwist[enc][p[j]])
           Swap(p[i], p[j]);
 
-    k = tbe->pawns[0];
+    k = entry->pawns[0];
     idx = PawnIdx[enc][k - 1][Flap[enc][p[0]]];
     for (int i = 1; i < k; i++)
       idx += Binomial[k-i][PawnTwist[enc][p[i]]];
     idx *= ei->factor[0];
 
     // Pawns of other color
-    if (tbe->pawns[1]) {
-      int t = k + tbe->pawns[1];
+    if (entry->pawns[1]) {
+      int t = k + entry->pawns[1];
       for (int i = k; i < t; i++)
         for (int j = i + 1; j < t; j++)
           if (p[i] > p[j]) Swap(p[i], p[j]);
@@ -943,21 +1165,21 @@ INLINE size_t encode(int *p, struct EncInfo *ei, struct TbEntry *tbe,
 }
 
 static NOINLINE size_t encode_piece(int *p, struct EncInfo *ei,
-    struct TbEntry *tbe)
+    struct TbEntry *entry)
 {
-  return encode(p, ei, tbe, LT_PIECE);
+  return encode(p, ei, entry, LT_PIECE);
 }
 
 static NOINLINE size_t encode_pawn_f(int *p, struct EncInfo *ei,
-    struct TbEntry *tbe)
+    struct TbEntry *entry)
 {
-  return encode(p, ei, tbe, LT_PAWN_FILE);
+  return encode(p, ei, entry, LT_PAWN_FILE);
 }
 
 static NOINLINE size_t encode_pawn_r(int *p, struct EncInfo *ei,
-    struct TbEntry *tbe)
+    struct TbEntry *entry)
 {
-  return encode(p, ei, tbe, LT_PAWN_RANK);
+  return encode(p, ei, entry, LT_PAWN_RANK);
 }
 
 // Count number of placements of k like pieces on n squares
@@ -971,12 +1193,12 @@ static size_t subfactor(size_t k, size_t n)
   return f;
 }
 
-static size_t init_enc_info(struct EncInfo *ei, struct TbEntry *tbe,
+static size_t init_enc_info(struct EncInfo *ei, struct TbEntry *entry,
     const uint8_t *tb, int shift, int t, const int lt)
 {
-  bool morePawns = lt != LT_PIECE && tbe->pawns[1] > 0;
+  bool morePawns = lt != LT_PIECE && entry->pawns[1] > 0;
 
-  for (int i = 0; i < tbe->num; i++) {
+  for (int i = 0; i < entry->num; i++) {
     ei->pieces[i] = (tb[i + 1 + morePawns] >> shift) & 0x0f;
     ei->norm[i] = 0;
   }
@@ -984,27 +1206,27 @@ static size_t init_enc_info(struct EncInfo *ei, struct TbEntry *tbe,
   int order = (tb[0] >> shift) & 0x0f;
   int order2 = morePawns ? (tb[1] >> shift) & 0x0f : 0x0f;
 
-  int k = ei->norm[0] =  lt != LT_PIECE ? tbe->pawns[0]
-                       : tbe->kk_enc ? 2 : 3;
+  int k = ei->norm[0] =  lt != LT_PIECE ? entry->pawns[0]
+                       : entry->kk_enc ? 2 : 3;
 
   if (morePawns) {
-    ei->norm[k] = tbe->pawns[1];
+    ei->norm[k] = entry->pawns[1];
     k += ei->norm[k];
   }
 
-  for (int i = k; i < tbe->num; i += ei->norm[i])
-    for (int j = i; j < tbe->num && ei->pieces[j] == ei->pieces[i]; j++)
+  for (int i = k; i < entry->num; i += ei->norm[i])
+    for (int j = i; j < entry->num && ei->pieces[j] == ei->pieces[i]; j++)
       ei->norm[i]++;
 
   int n = 64 - k;
   size_t f = 1;
 
-  for (int i = 0; k < tbe->num || i == order || i == order2; i++) {
+  for (int i = 0; k < entry->num || i == order || i == order2; i++) {
     if (i == order) {
       ei->factor[0] = f;
       f *=  lt == LT_PAWN_FILE ? PawnFactorFile[ei->norm[0] - 1][t]
           : lt == LT_PAWN_RANK ? PawnFactorRank[ei->norm[0] - 1][t]
-          : tbe->kk_enc ? 462 : 31332;
+          : entry->kk_enc ? 462 : 31332;
     } else if (i == order2) {
       ei->factor[ei->norm[0]] = f;
       f *= subfactor(ei->norm[ei->norm[0]], 48 - ei->norm[0]);
@@ -1019,7 +1241,7 @@ static size_t init_enc_info(struct EncInfo *ei, struct TbEntry *tbe,
   return f;
 }
 
-static void calc_symlen(struct PairsData *d, uint32_t s, char *tmp)
+static void calc_symlen(struct PairsData *d, uint32_t s, bool *tmp)
 {
   const uint8_t *w = d->symPat + 3 * s;
   uint32_t s2 = (w[2] << 4) | (w[1] >> 4);
@@ -1031,149 +1253,189 @@ static void calc_symlen(struct PairsData *d, uint32_t s, char *tmp)
     if (!tmp[s2]) calc_symlen(d, s2, tmp);
     d->symLen[s] = d->symLen[s1] + d->symLen[s2] + 1;
   }
-  tmp[s] = 1;
+  tmp[s] = true;
 }
 
-static struct PairsData *setup_pairs(const uint8_t **ptr, size_t tb_size,
-    size_t *size, uint8_t *flags, int type)
+struct PairsData *setup_huffman(const uint8_t **ptr)
 {
-  struct PairsData *d;
   const uint8_t *data = *ptr;
+  int max_len = data[8];
+  int min_len = data[9];
+  int h = max_len - min_len + 1;
+  uint32_t num_syms = read_le_u16(&data[10 + 2 * h]);
+  uint16_t *offset = (uint16_t *)(&data[10]);
 
-  *flags = data[0];
-  if (data[0] & 0x80) {
-    d = malloc(sizeof(*d));
-    d->idxBits = 0;
-    d->constValue[0] = type == WDL ? data[1] : 0;
-    d->constValue[1] = 0;
-    *ptr = data + 2;
-    size[0] = size[1] = size[2] = 0;
-    return d;
-  }
+  int hh = h;
 
-  uint8_t blockSize = data[1];
-  uint8_t idxBits = data[2];
-  uint32_t realNumBlocks = read_le_u32(&data[4]);
-  uint32_t numBlocks = realNumBlocks + data[3];
-  int maxLen = data[8];
-  int minLen = data[9];
-  int h = maxLen - minLen + 1;
-  uint32_t numSyms = read_le_u16(&data[10 + 2 * h]);
-  d = malloc(sizeof(*d) + h * sizeof(uint64_t) + numSyms);
-  d->blockSize = blockSize;
-  d->idxBits = idxBits;
-  d->offset = (uint16_t *)&data[10];
-  d->symLen = (uint8_t *)d + sizeof(*d) + h * sizeof(uint64_t);
+  uint64_t tmp_base[32];
+  for (int i = h - 1; i < hh; i++)
+    tmp_base[i] = 0;
+  for (int i = h - 2; i >= 0; i--)
+    tmp_base[i] = (tmp_base[i + 1] + offset[i] - offset[i + 1]) / 2;
+  for (int i = 0; i < h; i++)
+    tmp_base[i] <<= 64 - (min_len + i);
+
+  int num_lu = 0;
+
+  struct PairsData *d =
+    malloc(sizeof(*d) + hh * sizeof(uint64_t) + num_lu * 4 + num_syms);
+  d->comprType = 0;
+  for (int i = 0; i < hh; i++)
+    d->base[i] = tmp_base[i];
+  d->offset = offset;
+  d->symLen = (uint8_t *)(d + 1) + h * sizeof(uint64_t);
   d->symPat = &data[12 + 2 * h];
-  d->minLen = minLen;
-  *ptr = &data[12 + 2 * h + 3 * numSyms + (numSyms & 1)];
+  d->minLen = min_len;
+  *ptr = &data[12 + 2 * h + 3 * num_syms + (num_syms & 1)];
 
-  size_t numIndices = (tb_size + (1ULL << idxBits) - 1) >> idxBits;
-  size[0] = 6ULL * numIndices;
-  size[1] = 2ULL * numBlocks;
-  size[2] = (size_t)realNumBlocks << blockSize;
-
-  char tmp[4096];
-  memset(tmp, 0, numSyms);
-  for (uint32_t s = 0; s < numSyms; s++)
+  bool tmp[4096] = { 0 };
+  for (uint32_t s = 0; s < num_syms; s++)
     if (!tmp[s])
       calc_symlen(d, s, tmp);
 
-  d->base[h - 1] = 0;
-  for (int i = h - 2; i >= 0; i--)
-    d->base[i] = ( d->base[i + 1] + read_le_u16((uint8_t *)(d->offset + i)) -
-                   read_le_u16((uint8_t *)(d->offset + i + 1)) ) / 2;
-  for (int i = 0; i < h; i++)
-    d->base[i] <<= 64 - (minLen + i);
+  for (uint64_t i = 0; i < (1 << STARTBITS); i++) {
+    uint64_t code = ((i + 1) << (64 - STARTBITS)) - 1;
+    int l = 0;
+    while (code < d->base[l]) l++;
+    d->start[i] = l + d->minLen;
+  }
 
   d->offset -= d->minLen;
 
   return d;
 }
 
-static NOINLINE struct Tbase *init_tbase(struct TbEntry *tbe, const char *str,
-    int type)
+static struct PairsData *setup_rans(const uint8_t **ptr)
 {
-  map_t mapping;
-  const uint8_t *data = map_tb(str, suffix[type], &mapping);
-  if (!data) return NULL;
+  const uint8_t *data = *ptr;
 
-  if (read_le_u32(data) != magic[type]) {
-    fprintf(stderr, "Invalid tablebase file.\n");
-    unmap_file(data, mapping);
-    return NULL;
+  struct PairsData *d = malloc(sizeof(struct PairsData));
+  d->comprType = 1;
+
+  int num_syms;
+  d->rans = calloc(1, sizeof(struct RansDecode));
+  const uint8_t *p = read_freq_table(d->rans, &num_syms, data + 10);
+//  d->num_syms = num_syms;
+  make_alias_table(d->rans);
+
+  d->symPat = p;
+  d->symLen = malloc(num_syms);
+  bool tmp[4096] = { 0 };
+  for (int s = 0; s < num_syms; s++)
+    if (!tmp[s])
+      calc_symlen(d, s, tmp);
+
+  *ptr = p + 3 * num_syms + (num_syms & 1);
+
+  return d;
+}
+
+static struct PairsData *setup_pairs(const uint8_t **ptr, size_t tb_size,
+    size_t *size, uint8_t *flags, int type, bool new)
+{
+  struct PairsData *d;
+  const uint8_t *data = *ptr;
+
+  if (!new) {
+    *flags = data[0];
+    if (data[0] & 0x80) {
+      d = malloc(sizeof(*d));
+      d->idxBits = 0;
+      d->constValue[0] = type == WDL ? data[1] : 0;
+      d->constValue[1] = 0;
+      *ptr = data + 2;
+      size[0] = size[1] = size[2] = 0;
+      return d;
+    }
+    d = (data[0] & 0x40) ? setup_rans(ptr) : setup_huffman(ptr);
+  } else {
+    d = data[0] == 2 ? setup_rans(ptr) : setup_huffman(ptr);
   }
 
-  int num = num_tables(tbe, type);
-  struct Tbase *tbase = malloc(sizeof(struct Tbase) + num * sizeof(void *));
-  tbase->data = data;
-  tbase->mapping = mapping;
-  tbase->layout =  !tbe->hasPawns ? LT_PIECE
-                 : type == DTZ ? LT_PAWN_FILE : LT_PAWN_RANK;
+  uint8_t blockSize = data[1];
+  uint8_t idxBits = data[2];
+  uint32_t realNumBlocks = read_le_u32(&data[4]);
+  uint32_t numBlocks = realNumBlocks + data[3];
 
-  bool split = type != DTZ && (data[4] & 0x01);
+  d->blockSize = blockSize;
+  d->idxBits = idxBits;
+
+  size_t numIndices = (tb_size + (1ULL << idxBits) - 1) >> idxBits;
+  size[0] = 6ULL * numIndices;
+  size[1] = 2ULL * numBlocks;
+  size[2] = (size_t)realNumBlocks << blockSize;
+
+  return d;
+}
+
+static NOINLINE struct Tbase *init_old(struct TbEntry *entry,
+    struct Tbase *tb, int type, const uint8_t *data)
+{
+  bool split = type != DTZ && (data[0] & 0x01);
+  assert(split == (type != DTZ && !entry->symmetric));
+
   if (type == DTM)
-    tbase->distFormat = (data[4] & 0x04) ? L_ONLY : WL_BOTH;
+    tb->distFormat = (data[0] & 0x04) ? L_ONLY : WL_BOTH;
   if (type == DTZ)
-    tbase->distFormat = WL_WTM; // FIXME
-  tbase->flipped = false; // FIXME
+    tb->distFormat = WL_WTM; // FIXME
+  tb->flipped = false; // FIXME
 
-  data += 5;
+  data += 1;
 
   size_t tb_size[6][2];
+  struct TbTable *table[12];
 
-  for (int t = 0; t < num; t++)
-    tbase->table[t] = malloc(TABLE_SIZE[type]);
+  int num = entry->hasPawns ? 4 : 1;
+  for (int t = 0; t < num; t++) {
+    table[t] = malloc(TABLE_SIZE[type]);
+    atomic_store_explicit(&tb->table[t], table[t], memory_order_relaxed);
+  }
   if (split)
-    for (int t = 0; t < num; t++)
-      tbase->table[num + t] = malloc(TABLE_SIZE[type]);
-
-  tbase->layout =  !tbe->hasPawns ? LT_PIECE
-                 : type != DTM ? LT_PAWN_FILE : LT_PAWN_RANK;
+    for (int t = 0; t < num; t++) {
+      table[num + t] = malloc(TABLE_SIZE[type]);
+      atomic_store_explicit(&tb->table[t + num], table[t + num],
+          memory_order_relaxed);
+    }
 
   for (int t = 0; t < num; t++) {
-    struct EncInfo *ei = &tbase->table[t]->ei;
-    tb_size[t][0] = init_enc_info(ei, tbe, data, 0, t, tbase->layout);
+    struct EncInfo *ei = &table[t]->ei;
+    tb_size[t][0] = init_enc_info(ei, entry, data, 0, t, tb->layout);
     if (split) {
-      ei = &tbase->table[num + t]->ei;
-      tb_size[t][1] = init_enc_info(ei, tbe, data, 4, t, tbase->layout);
+      ei = &table[num + t]->ei;
+      tb_size[t][1] = init_enc_info(ei, entry, data, 4, t, tb->layout);
     }
-    data += tbe->num + 1 + (tbe->hasPawns && tbe->pawns[1]);
+    data += entry->num + 1 + (entry->hasPawns && entry->pawns[1]);
   }
   data += (uintptr_t)data & 1;
 
   size_t size[6][2][3];
   for (int t = 0; t < num; t++) {
     uint8_t flags;
-    struct EncInfo *ei = &tbase->table[t]->ei;
-    ei->precomp = setup_pairs(&data, tb_size[t][0], size[t][0], &flags, type);
+    struct EncInfo *ei = &table[t]->ei;
+    ei->precomp = setup_pairs(&data, tb_size[t][0], size[t][0], &flags, type,
+        false);
     if (type == DTZ) {
-      struct DtzTable *dtz = (struct DtzTable *)tbase->table[t];
+      struct DtzTable *dtz = (struct DtzTable *)table[t];
       dtz->dtzFlags = flags;
     }
     if (split) {
-      struct EncInfo *ei = &tbase->table[num + t]->ei;
-      ei[t].precomp = setup_pairs(&data, tb_size[t][1], size[t][1],
-          &flags, type);
+      struct EncInfo *ei = &table[num + t]->ei;
+      ei[t].precomp = setup_pairs(&data, tb_size[t][1], size[t][1], &flags,
+          type, false);
     }
     else if (type != DTZ)
       ei[num + t].precomp = NULL;
   }
 
   // FIXME: This does not support WL_BOTH.
-  if (type == DTM && tbase->distFormat != L_ONLY) {
+  if (type == DTM && tb->distFormat != L_ONLY) {
+    const void *map = data;
     for (int t = 0; t < num; t++) {
-      struct DtmTable *dtm = (struct DtmTable *)tbase->table[t];
-      dtm->dtmMap = (uint16_t *)data;
+      struct DtmTable *dtm = (struct DtmTable *)table[t];
+      dtm->dtmMap = map;
       for (int i = 0; i < 2; i++) {
-        dtm->dtmMapIdx[0][i] = (uint16_t *)data + 1 - dtm->dtmMap;
+        dtm->dtmMapIdx[i] = (uint16_t *)data + 1 - dtm->dtmMap;
         data += 2 + 2 * read_le_u16(data);
-      }
-      if (split) {
-        for (int i = 0; i < 2; i++) {
-          dtm->dtmMapIdx[1][i] = (uint16_t *)data + 1 - dtm->dtmMap;
-          data += 2 + 2 * read_le_u16(data);
-        }
       }
     }
   }
@@ -1181,7 +1443,7 @@ static NOINLINE struct Tbase *init_tbase(struct TbEntry *tbe, const char *str,
   if (type == DTZ) {
     const void *map = data;
     for (int t = 0; t < num; t++) {
-      struct DtzTable *dtz = (struct DtzTable *)tbase->table[t];
+      struct DtzTable *dtz = (struct DtzTable *)table[t];
       if (dtz->dtzFlags & 2) {
         if (!(dtz->dtzFlags & 16)) {
           dtz->dtzMap = map;
@@ -1203,22 +1465,22 @@ static NOINLINE struct Tbase *init_tbase(struct TbEntry *tbe, const char *str,
   }
 
   for (int t = 0; t < num; t++) {
-    struct EncInfo *ei = &tbase->table[t]->ei;
+    struct EncInfo *ei = &table[t]->ei;
     ei->precomp->indexTable = data;
     data += size[t][0][0];
     if (split) {
-      struct EncInfo *ei = &tbase->table[num + t]->ei;
+      struct EncInfo *ei = &table[num + t]->ei;
       ei->precomp->indexTable = data;
       data += size[t][1][0];
     }
   }
 
   for (int t = 0; t < num; t++) {
-    struct EncInfo *ei = &tbase->table[t]->ei;
+    struct EncInfo *ei = &table[t]->ei;
     ei->precomp->sizeTable = (uint16_t *)data;
     data += size[t][0][1];
     if (split) {
-      struct EncInfo *ei = &tbase->table[num + t]->ei;
+      struct EncInfo *ei = &table[num + t]->ei;
       ei->precomp->sizeTable = (uint16_t *)data;
       data += size[t][1][1];
     }
@@ -1226,12 +1488,12 @@ static NOINLINE struct Tbase *init_tbase(struct TbEntry *tbe, const char *str,
 
   for (int t = 0; t < num; t++) {
     data = (uint8_t *)(((uintptr_t)data + 0x3f) & ~0x3f);
-    struct EncInfo *ei = &tbase->table[t]->ei;
+    struct EncInfo *ei = &table[t]->ei;
     ei->precomp->data = data;
     data += size[t][0][2];
     if (split) {
       data = (uint8_t *)(((uintptr_t)data + 0x3f) & ~0x3f);
-      struct EncInfo *ei = &tbase->table[num + t]->ei;
+      struct EncInfo *ei = &table[num + t]->ei;
       ei->precomp->data = data;
       data += size[t][1][2];
     }
@@ -1246,11 +1508,129 @@ static NOINLINE struct Tbase *init_tbase(struct TbEntry *tbe, const char *str,
     for (int i = 0; i < be->num; i++)
       count[ei[0].pieces[i]]++;
     PWN_E(be)->dtmSwitched =
-        TB_material_key_from_counts(count, count + 8) != be->key;
+      TB_material_key_from_counts(count, count + 8) != be->key;
   }
 #endif
 
-  return tbase;
+  return tb;
+}
+
+static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
+    int type)
+{
+  map_t mapping;
+  const uint8_t *restrict data = map_tb(str, suffix[type], &mapping);
+  if (!data) return NULL;
+
+  if (read_le_u32(data) == magic[type]) {
+    int num = entry->hasPawns ? type == DTM ? 6 : 4 : 1;
+    if (type != DTZ && !entry->symmetric)
+      num *= 2;
+    struct Tbase *tb = malloc(sizeof(struct Tbase) + num * sizeof(void *));
+    tb->data = data;
+    tb->mapping = mapping;
+    tb->layout = !entry->hasPawns ? LT_PIECE : LT_PAWN_FILE;
+    return init_old(entry, tb, type, data + 4);
+  }
+
+  if (read_le_u32(data) == magic2[type]) {
+    if (type == DTZ && data[4] == 0) {
+      // FIXME: idea is to support W_ONLY/L_ONLY for old-format DTZ.
+      // rANS-compressed DTZ should also use magic2.
+      int num = entry->hasPawns ? 4 : 1;
+      if (!entry->symmetric)
+        num *= 2;
+      struct Tbase *tb = malloc(sizeof(struct Tbase) + num * sizeof(void *));
+      tb->data = data;
+      tb->mapping = mapping;
+      tb->layout = !entry->hasPawns ? LT_PIECE : LT_PAWN_FILE;
+      return init_old(entry, tb, type, data + 5);
+    }
+
+    // Check version.
+    if (data[4] != 1)
+      return NULL;
+
+    const uint8_t *p = data + 4 + entry->num;
+    bool two_sided = !entry->symmetric;
+    int distFormat;
+    if (type != WDL) {
+      distFormat = *p++;
+      two_sided = two_sided && distFormat != WL_WTM && distFormat != WL_BTM;
+    }
+    int layout = *p++;
+    int num = layout == LT_PIECE ? 1 : layout == LT_PIECE_K ? 10 : 462;
+    num *= 1 + two_sided;
+
+    struct Tbase *tbase = malloc(sizeof(struct Tbase) + num * sizeof(void *));
+    tbase->data = data;
+    tbase->mapping = mapping;
+    tbase->layout = layout;
+    if (type != WDL)
+      tbase->distFormat = distFormat;
+    tbase->flipped = false; // FIXME
+    tbase->offset = ((p - data) + 7) & ~7;
+    return tbase;
+  }
+
+  fprintf(stderr, "Invalid tablebase file.\n");
+  unmap_file(data, mapping);
+  return NULL;
+}
+
+NOINLINE struct TbTable *init_new_table(struct TbEntry *entry, struct Tbase *tb,
+    int type, int t)
+{
+  struct TbTable *table = malloc(TABLE_SIZE[type]);
+  const uint64_t *offsets = (uint64_t *)((uint8_t *)tb->data + tb->offset);
+  const uint8_t *data = (uint8_t *)tb->data + offsets[t];
+
+  if (data[0] == 0) {
+    // FIXME how to encode trivial tables? PairsData?
+  }
+  int n = entry->num;
+  // FIXME init IdxInfo
+  uint64_t tb_size = 0;
+  data += n - 2;
+  int mapped = data[0];
+  data += (uintptr_t)data & 1;
+
+  size_t size[3];
+  table->ei.precomp = setup_pairs(&data, tb_size, size, NULL, type, true);
+
+  if (type == DTM && mapped) {
+    struct DtmTable *dtm = (struct DtmTable *)table;
+    dtm->dtmMap = (uint16_t *)data;
+    for (int i = 0; i < 2; i++) {
+      dtm->dtmMapIdx[i] = (uint16_t *)data + 1 - dtm->dtmMap;
+      data += 2 + 2 * read_le_u16(data);
+    }
+  }
+
+  if (type == DTZ && mapped) {
+    struct DtzTable *dtz = (struct DtzTable *)table;
+    if (mapped == 1) {
+      dtz->dtzMap = data;
+      for (int i = 0; i < 4; i++) {
+        dtz->dtzMapIdx[i] = data + 1 - dtz->dtzMap;
+        data += 1 + data[0];
+      }
+    } else {
+      dtz->dtzMap16 = (uint16_t *)data;
+      for (int i = 0; i < 4; i++) {
+        dtz->dtzMapIdx[i] = (uint16_t *)data + 1 - dtz->dtzMap16;
+        data += 2 + 2 * read_le_u16(data);
+      }
+    }
+  }
+
+  table->ei.precomp->indexTable = data;
+  data += size[0];
+  table->ei.precomp->sizeTable = (uint16_t *)data;
+  data += size[1];
+  table->ei.precomp->data = data;
+
+  return table;
 }
 
 static const uint8_t *decompress_pairs(struct PairsData *d, size_t idx)
@@ -1338,8 +1718,8 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     return 0;
   }
 
-  struct TbEntry *tbe = tbHash[hashIdx].ptr;
-  if ((type == DTM && !tbe->hasDtm) || (type == DTZ && !tbe->hasDtz)) {
+  struct TbEntry *entry = tbHash[hashIdx].ptr;
+  if ((type == DTM && !entry->hasDtm) || (type == DTZ && !entry->hasDtz)) {
     *result = FAIL;
     return 0;
   }
@@ -1347,123 +1727,155 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
   struct Tbase *tb;
 
   // Use double-checked locking to reduce locking overhead.
-  if (!(tb = atomic_load_explicit(&tbe->tbase[type], memory_order_acquire))) {
+  if (!(tb = atomic_load_explicit(&entry->tbase[type], memory_order_acquire))) {
     LOCK(mutex);
-    if (!(tb = atomic_load_explicit(&tbe->tbase[type], memory_order_relaxed))) {
+    if (!(tb = atomic_load_explicit(&entry->tbase[type], memory_order_relaxed)))
+    {
       char str[16], str2[16];
       TB_material_string(pos, str);
-      if (tbe->key != key) { // KRvKQ -> KQvKR
+      if (entry->key != key) { // KRvKQ -> KQvKR
         char *s = strchr(str, 'v');
         sprintf(str2, "%sv%.*s", s + 1, (int)(s - str), str);
       }
-      if (!(tb = init_tbase(tbe, tbe->key == key ? str : str2, type))) {
+      if (!(tb = init_tb(entry, entry->key == key ? str : str2, type))) {
         tbHash[hashIdx].ptr = NULL; // Mark as deleted.
         *result = FAIL;
         UNLOCK(mutex);
         return 0;
       }
-      atomic_store_explicit(&tbe->tbase[type], tb, memory_order_release);
+      atomic_store_explicit(&entry->tbase[type], tb, memory_order_release);
     }
     UNLOCK(mutex);
   }
 
-  if (type == DTM || type == DTZ) {
-    if (   (tb->distFormat == W_ONLY && s <= 0)
-        || (tb->distFormat == L_ONLY && s > 0))
-    {
-      // A 1-ply search is needed.
-      *result = CHANGE_STM;
-      return 0;
+  if (tb->layout != LT_PIECE_KK) {
+
+    if (type == DTM || type == DTZ) {
+      if (   (tb->distFormat == W_ONLY && s <= 0)
+          || (tb->distFormat == L_ONLY && s > 0))
+      {
+        // A 1-ply search is needed.
+        *result = CHANGE_STM;
+        return 0;
+      }
     }
-  }
 
-  bool btm_side, flip;
-  if (!tbe->symmetric) {
-    flip = (key != tbe->key) != tb->flipped;  // Flip colours?
-    btm_side = TB_white_to_move(pos) == flip; // Probe btm?
-  } else {
-    // Probe the wtm side for symmetric tables.
-    flip = !TB_white_to_move(pos);
-    btm_side = false;
-  }
-
-  // FIXME: filed-based pawnful DTZ may have different WTM/BTM per file.
-  if (type == DTM) { // || type == DTZ)
-    if (   (tb->distFormat == WL_WTM && btm_side)
-        || (tb->distFormat == WL_BTM && !btm_side))
-    {
-      *result = CHANGE_STM;
-      return 0;
+    bool btm_side, flip;
+    if (!entry->symmetric) {
+      flip = (key != entry->key) != tb->flipped;  // Flip colours?
+      btm_side = TB_white_to_move(pos) == flip; // Probe btm?
+    } else {
+      // Probe the wtm side for symmetric tables.
+      flip = !TB_white_to_move(pos);
+      btm_side = false;
     }
+
+    // FIXME: file-based pawnful DTZ may have different WTM/BTM per file.
+    if (type == DTM) { // || type == DTZ)
+      if (   (tb->distFormat == WL_WTM && btm_side)
+          || (tb->distFormat == WL_BTM && !btm_side))
+      {
+        *result = CHANGE_STM;
+        return 0;
+      }
+    }
+
+    int p[TB_PIECES];
+    size_t idx;
+    int t = 0;
+    struct EncInfo *ei;
+    struct TbTable *table;
+
+    if (!entry->hasPawns) {
+      t =  (type != DTZ && (type == WDL || tb->distFormat != WL_BTM))
+         ? btm_side : 0;
+      table = atomic_load_explicit(&tb->table[t], memory_order_relaxed);
+      if (type == DTZ) {
+        struct DtzTable *dtz = (struct DtzTable *)table;
+        if ((dtz->dtzFlags & 1) != btm_side && !entry->symmetric) {
+          *result = CHANGE_STM;
+          return 0;
+        }
+      }
+      ei = &table->ei;
+      TB_list_squares(pos, ei->pieces, flip, p);
+      idx = encode_piece(p, ei, entry);
+    } else {
+      table = atomic_load_explicit(&tb->table[0], memory_order_relaxed);
+      ei = &table->ei;
+      TB_list_squares(pos, ei->pieces, flip, p);
+      t = leading_pawn(p, entry, tb->layout);
+      // FIXME
+      t = type == WDL ? t + 4 * btm_side : type == DTM ? t + 6 * btm_side : t;
+      table = atomic_load_explicit(&tb->table[t], memory_order_relaxed);
+      if (type == DTZ) {
+        struct DtzTable *dtz = (struct DtzTable *)table;
+        if ((dtz->dtzFlags & 1) != btm_side && !entry->symmetric) {
+          *result = CHANGE_STM;
+          return 0;
+        }
+      }
+      ei = &table->ei;
+      TB_list_squares(pos, ei->pieces, flip, p);
+      // Bring the leading pawn back to the front.
+      leading_pawn(p, entry, tb->layout);
+      // FIXME
+      idx = type != DTM ? encode_pawn_f(p, ei, entry)
+                        : encode_pawn_r(p, ei, entry);
+    }
+
+    TB_ProbeCount[type]++;
+
+    const uint8_t *w = decompress_pairs(ei->precomp, idx);
+
+    if (type == WDL)
+      return (int)w[0] - 2;
+
+    int v = w[0] + ((w[1] & 0x0f) << 8);
+
+    if (type == DTM) {
+      struct DtmTable *dtm = (struct DtmTable *)table;
+      if (tb->distFormat != W_ONLY && tb->distFormat != L_ONLY)
+        v = from_le_u16(dtm->dtmMap[dtm->dtmMapIdx[s] + v]);
+    }
+
+    if (type == DTZ) {
+      struct DtzTable *dtz = (struct DtzTable *)table;
+      if (dtz->dtzFlags & 2) {
+        int m = WdlToMap[s + 2];
+        if (!(dtz->dtzFlags & 16))
+          v = dtz->dtzMap[dtz->dtzMapIdx[m] + v];
+        else
+          v = dtz->dtzMap16[dtz->dtzMapIdx[m] + v];
+      }
+      if (!(dtz->dtzFlags & PAFlags[s + 2]) || (s & 1))
+        v *= 2;
+    }
+
+    return v;
   }
 
+  struct TbTable *table;
   int p[TB_PIECES];
-  size_t idx;
-  int t = 0;
-  struct EncInfo *ei;
+  bool flip = !entry->symmetric ? key != entry->key : !TB_white_to_move(pos);
+  int btm_side = TB_white_to_move(pos) == flip;
+  TB_list_squares(pos, entry->pt, key != entry->key, p);
 
-  if (!tbe->hasPawns) {
-    t = (type != DTZ && (type == WDL || tb->distFormat != WL_BTM)) ? btm_side : 0;
-    if (type == DTZ) {
-      struct DtzTable *dtz = (struct DtzTable *)tb->table[t];
-      if ((dtz->dtzFlags & 1) != btm_side && !tbe->symmetric) {
-        *result = CHANGE_STM;
-        return 0;
-      }
+  int t = KKMap[p[0]][p[1]];
+  assert(t >= 0);
+  if (   !entry->symmetric
+      && (type == WDL || tb->distFormat == W_ONLY || tb->distFormat == L_ONLY))
+    t = 2 * t + btm_side;
+  if (!(table = atomic_load_explicit(&tb->table[t], memory_order_acquire))) {
+    LOCK(mutex);
+    if (!(table = atomic_load_explicit(&tb->table[t], memory_order_relaxed))) {
+      table = init_new_table(entry, tb, type, t);
+      atomic_store_explicit(&tb->table[t], table, memory_order_relaxed);
     }
-    ei = &tb->table[t]->ei;
-    TB_list_squares(pos, ei->pieces, flip, p);
-    idx = encode_piece(p, ei, tbe);
-  } else {
-    ei = &tb->table[0]->ei;
-    TB_list_squares(pos, ei->pieces, flip, p);
-    t = leading_pawn(p, tbe, tb->layout);
-    if (type == DTZ) {
-      struct DtzTable *dtz = (struct DtzTable *)tb->table[t];
-      if ((dtz->dtzFlags & 1) != btm_side && !tbe->symmetric) {
-        *result = CHANGE_STM;
-        return 0;
-      }
-    }
-    // FIXME
-    t = type == WDL ? t + 4 * btm_side : type == DTM ? t + 6 * btm_side : t;
-    ei = &tb->table[t]->ei;
-    TB_list_squares(pos, ei->pieces, flip, p);
-    // Bring the leading pawn back to the front.
-    leading_pawn(p, tbe, tb->layout);
-    // FIXME
-    idx = type != DTM ? encode_pawn_f(p, ei, tbe) : encode_pawn_r(p, ei, tbe);
+    UNLOCK(mutex);
   }
 
-  TB_ProbeCount[type]++;
-
-  const uint8_t *w = decompress_pairs(ei->precomp, idx);
-
-  if (type == WDL)
-    return (int)w[0] - 2;
-
-  int v = w[0] + ((w[1] & 0x0f) << 8);
-
-  if (type == DTM) {
-    struct DtmTable *dtm = (struct DtmTable *)tb->table[t];
-    if (tb->distFormat != W_ONLY && tb->distFormat != L_ONLY)
-      v = from_le_u16(dtm->dtmMap[dtm->dtmMapIdx[btm_side][s] + v]);
-  }
- 
-  if (type == DTZ) {
-    struct DtzTable *dtz = (struct DtzTable *)tb->table[t];
-    if (dtz->dtzFlags & 2) {
-      int m = WdlToMap[s + 2];
-      if (!(dtz->dtzFlags & 16))
-        v = dtz->dtzMap[dtz->dtzMapIdx[m] + v];
-      else
-        v = dtz->dtzMap16[dtz->dtzMapIdx[m] + v];
-    }
-    if (!(dtz->dtzFlags & PAFlags[s + 2]) || (s & 1))
-      v *= 2;
-  }
-
-  return v;
+  // FIXME: calculate idx and look up value.
 }
 
 static NOINLINE int probe_wdl_table(TB_Position *pos, int *result)
