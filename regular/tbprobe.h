@@ -125,7 +125,8 @@ void TB_material_string(TB_Position *pos, char str[16]);
 // listed in pt[] consecutively.
 // If 'flip' is true, then the function must flip both the color of the
 // piece types read from pt[] (^0x08) and the squares stored in p[] (^0x38).
-void TB_list_squares(TB_Position *pos, const uint8_t *pt, bool flip, int *p);
+void TB_list_squares(TB_Position *pos, const uint8_t *pt, bool flip,
+    uint8_t *p);
 
 // Generate all (pseudo-)legal captures, including promotions and
 // underpromotions, and store them inside or in association with the

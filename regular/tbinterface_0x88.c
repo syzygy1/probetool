@@ -279,7 +279,8 @@ void TB_material_string(TB_Position *pos, char str[16])
   str[j] = 0;
 }
 
-void TB_list_squares(TB_Position *pos, const uint8_t *pt, bool flip, int *p)
+void TB_list_squares(TB_Position *pos, const uint8_t *restrict pt, bool flip,
+    uint8_t *restrict p)
 {
   for (int i = 0; i < pos->num; ) {
     int t = pt[i] ^ (flip << 3);
