@@ -391,13 +391,12 @@ static const uint8_t *read_freq_table(struct RansDecode *d, int *num_syms,
 enum {
   TB_PIECES = 8,
   TB_SETS = 6,
-  TB_HASHBITS = 12,
-  TB_MAX_PIECE = 650,
-  TB_MAX_PAWN = 861
+  TB_HASHBITS = 13,
+  TB_MAX_TABLES = 4031
 };
 
 enum { WDL = TB_WDL, DTM = TB_DTM, DTZ = TB_DTZ };
-enum { WL_BOTH, WL_WTM, WL_BTM, W_ONLY, L_ONLY };
+enum { WL_BOTH = 0, WL_WTM, WL_BTM, W_ONLY, L_ONLY };
 enum { LT_PIECE = 0, LT_PIECE_K, LT_PIECE_KK, LT_PAWN_FILE, LT_PAWN_RANK };
 enum { FAIL = 0, OK = 1, CHANGE_STM = -1, ZEROING_IS_BEST = 2 };
 
@@ -509,7 +508,6 @@ struct DtzTable2 {
   uint16_t dtzMapIdx[4];
   uint8_t mapped;
 };
-
 
 static const size_t TABLE_SIZE[3] = {
   sizeof(struct WdlTable), sizeof(struct DtmTable), sizeof(struct DtzTable)
@@ -662,11 +660,9 @@ static void detect_tb(char *str)
   uint64_t key  = TB_material_key_from_counts(pcs, pcs + 8);
   uint64_t key2 = TB_material_key_from_counts(pcs + 8, pcs);
 
-  bool hasPawns = pcs[1] || pcs[9];
-
   struct TbEntry *entry = &tbEntry[numTBs++];
   *entry = (struct TbEntry){ 0 };
-  entry->hasPawns = hasPawns;
+  entry->hasPawns = pcs[1] || pcs[9];
   entry->key = key;
   entry->symmetric = key == key2;
   for (int i = 0; i < 16; i++) {
@@ -793,7 +789,7 @@ void TB_init(const char *pathList)
   LOCK_INIT(mutex);
 
   if (!tbEntry) {
-    tbEntry = malloc((TB_MAX_PIECE + TB_MAX_PAWN) * sizeof *tbEntry);
+    tbEntry = malloc(TB_MAX_TABLES * sizeof *tbEntry);
     if (!tbEntry) {
       fprintf(stderr, "Out of memory.\n");
       exit(EXIT_FAILURE);
@@ -1073,7 +1069,7 @@ static const uint8_t FileToFile[] = { 0, 1, 2, 3, 3, 2, 1, 0 };
 static const int WdlToMap[5] = { 1, 3, 0, 2, 0 };
 static const uint8_t PAFlags[5] = { 8, 0, 0, 0, 4 };
 
-static size_t Binomial[7][64];
+static uint32_t Binomial[8][64];
 static size_t PawnIdx[2][6][24];
 static size_t PawnFactorFile[6][4];
 static size_t PawnFactorRank[6][6];
@@ -1089,7 +1085,7 @@ static void init_indices(void)
   // Binomial[k][n] = Bin(n, k)
   for (j = 0; j < 64; j++)
     Binomial[0][j] = 1;
-  for (i = 1; i < 7; i++)
+  for (i = 1; i < 8; i++)
     for (j = 1; j < 64; j++)
       Binomial[i][j] = Binomial[i - 1][j - 1] + Binomial[i][j - 1];
 
@@ -1165,6 +1161,7 @@ INLINE size_t encode(uint8_t *restrict p, struct EncInfo *ei,
 {
   int n = entry->num;
   size_t idx;
+  Bitboard occ;
   int k;
 
   if (p[0] & 0x04)
@@ -1184,6 +1181,7 @@ INLINE size_t encode(uint8_t *restrict p, struct EncInfo *ei,
         break;
       }
 
+    occ = bit(p[0]) | bit(p[1]);
     if (entry->kk_enc) {
       idx = KKIdx[Triangle[p[0]]][p[1]];
       k = 2;
@@ -1202,6 +1200,7 @@ INLINE size_t encode(uint8_t *restrict p, struct EncInfo *ei,
         idx =  6*63*62 + 4*28*62 + 4*7*28 + Diag[p[0]] * 7*6
              + (Diag[p[1]] - s1) * 6 + (Diag[p[2]] - s2);
       k = 3;
+      occ |= bit(p[2]);
     }
     idx *= ei->factor[0];
   } else {
@@ -1217,40 +1216,36 @@ INLINE size_t encode(uint8_t *restrict p, struct EncInfo *ei,
       idx += Binomial[k-i][PawnTwist[enc][p[i]]];
     idx *= ei->factor[0];
 
+    occ = 0;
+    for (int i = 0; i < k; i++)
+      occ |= bit(p[i]);
+
     // Pawns of other color
     if (entry->pawns[1]) {
       int t = k + entry->pawns[1];
-      for (int i = k; i < t; i++)
-        for (int j = i + 1; j < t; j++)
-          if (p[i] > p[j]) Swap(p[i], p[j]);
+      sort_squares(entry->pawns[1], &p[k]);
       size_t s = 0;
       for (int i = k; i < t; i++) {
-        int sq = p[i];
-        int skips = 0;
-        for (int j = 0; j < k; j++)
-          skips += (sq > p[j]);
-        s += Binomial[i - k + 1][sq - skips - 8];
+        int rank = rank_among_free(p[i], occ);
+        s += Binomial[i - k + 1][rank - 8];
       }
       idx += s * ei->factor[k];
-      k = t;
+      for (; k < t; k++)
+        occ |= bit(p[k]);
     }
   }
 
   for (; k < n;) {
     int t = k + ei->norm[k];
-    for (int i = k; i < t; i++)
-      for (int j = i + 1; j < t; j++)
-        if (p[i] > p[j]) Swap(p[i], p[j]);
+    sort_squares(ei->norm[k], &p[k]);
     size_t s = 0;
     for (int i = k; i < t; i++) {
-      int sq = p[i];
-      int skips = 0;
-      for (int j = 0; j < k; j++)
-        skips += (sq > p[j]);
-      s += Binomial[i - k + 1][sq - skips];
+      int rank = rank_among_free(p[i], occ);
+      s += Binomial[i - k + 1][rank];
     }
     idx += s * ei->factor[k];
-    k = t;
+    for (; k < t; k++)
+      occ |= bit(p[k]);
   }
 
   return idx;
@@ -1324,12 +1319,12 @@ static size_t init_enc_info(struct EncInfo *ei, struct TbEntry *entry,
 
 static void calc_symlen(struct PairsData *d, uint32_t s, bool *tmp)
 {
-  const uint8_t *w = d->symPat + 3 * s;
-  uint32_t s2 = (w[2] << 4) | (w[1] >> 4);
+  const uint32_t w = read_le_u32(d->symPat + 3 * s);
+  uint32_t s2 = (w >> 12) & 0xfff;
   if (s2 == 0x0fff)
     d->symLen[s] = 0;
   else {
-    uint32_t s1 = ((w[1] & 0xf) << 8) | w[0];
+    uint32_t s1 = w & 0xfff;
     if (!tmp[s1]) calc_symlen(d, s1, tmp);
     if (!tmp[s2]) calc_symlen(d, s2, tmp);
     d->symLen[s] = d->symLen[s1] + d->symLen[s2] + 1;
@@ -1464,7 +1459,7 @@ static NOINLINE struct Tbase *init_old(struct TbEntry *entry,
   size_t tb_size[6][2];
   struct TbTable *table[12];
 
-  int num = entry->hasPawns ? 4 : 1;
+  int num = entry->hasPawns ? type == DTM ? 6 : 4 : 1;
   for (int t = 0; t < num; t++) {
     table[t] = malloc(TABLE_SIZE[type]);
     atomic_store_explicit(&tb->table[t], table[t], memory_order_relaxed);
@@ -1585,7 +1580,7 @@ static NOINLINE struct Tbase *init_old(struct TbEntry *entry,
 }
 
 static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
-    int type)
+    const int type)
 {
   map_t mapping;
   const uint8_t *restrict data = map_tb(str, suffix[type], &mapping);
@@ -1651,7 +1646,7 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
   return NULL;
 }
 
-NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
+static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
     struct Tbase *tb, int type, int t)
 {
   const uint64_t *offsets = (uint64_t *)((uint8_t *)tb->data + tb->offset);
@@ -1906,6 +1901,10 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     }
   }
 
+  uint8_t p[TB_PIECES];
+  bool flip = !entry->symmetric ? key != entry->key : !TB_white_to_move(pos);
+  int btm_side = TB_white_to_move(pos) == flip;
+
   if (tb->layout != LT_PIECE_KK) {
 
     // Flip colours?
@@ -1924,15 +1923,13 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
       }
     }
 
-    uint8_t p[TB_PIECES];
     size_t idx;
-    int t = 0;
     struct EncInfo *ei;
     struct TbTable *table;
 
     if (!entry->hasPawns) {
-      t =  (type != DTZ && (type == WDL || tb->distFormat != WL_BTM))
-         ? btm_side : 0;
+      int t =  (type != DTZ && (type == WDL || tb->distFormat != WL_BTM))
+             ? btm_side : 0;
       table = atomic_load_explicit(&tb->table[t], memory_order_relaxed);
       if (type == DTZ) {
         struct DtzTable *dtz = (struct DtzTable *)table;
@@ -1948,9 +1945,9 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
       table = atomic_load_explicit(&tb->table[0], memory_order_relaxed);
       ei = &table->ei;
       TB_list_squares(pos, ei->pieces, flip, p);
-      t = leading_pawn(p, entry, tb->layout);
+      int t = leading_pawn(p, entry, tb->layout);
       // FIXME
-      t = type == WDL ? t + 4 * btm_side : type == DTM ? t + 6 * btm_side : t;
+      t += type == WDL ? 4 * btm_side : type == DTM ? 6 * btm_side : 0;
       table = atomic_load_explicit(&tb->table[t], memory_order_relaxed);
       if (type == DTZ) {
         struct DtzTable *dtz = (struct DtzTable *)table;
@@ -1997,85 +1994,85 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     }
 
     return v;
-  }
 
-  struct TbTable2 *table;
-  uint8_t p[TB_PIECES];
-  bool flip = !entry->symmetric ? key != entry->key : !TB_white_to_move(pos);
-  int btm_side = TB_white_to_move(pos) == flip;
-  TB_list_squares(pos, tb->pt, flip, p);
+  } else { /* PIECE_KK */
 
-  int t = KKMap[p[0]][p[1]];
-  assert(t >= 0);
-  if (   !entry->symmetric
-      && (type == WDL || tb->distFormat == W_ONLY || tb->distFormat == L_ONLY))
-    t = 2 * t + btm_side;
-  if (!(table = atomic_load_explicit(&tb->table[t], memory_order_acquire))) {
-    LOCK(mutex);
-    if (!(table = atomic_load_explicit(&tb->table[t], memory_order_relaxed))) {
-      table = init_new_table(entry, tb, type, t);
-      atomic_store_explicit(&tb->table[t], table, memory_order_release);
+    struct TbTable2 *table;
+    TB_list_squares(pos, tb->pt, flip, p);
+
+    int t = KKMap[p[0]][p[1]];
+    assert(t >= 0);
+    if (   !entry->symmetric
+        && (type == WDL || tb->distFormat == W_ONLY || tb->distFormat == L_ONLY))
+      t = 2 * t + btm_side;
+    if (!(table = atomic_load_explicit(&tb->table[t], memory_order_acquire))) {
+      LOCK(mutex);
+      if (!(table = atomic_load_explicit(&tb->table[t], memory_order_relaxed)))
+      {
+        table = init_new_table(entry, tb, type, t);
+        atomic_store_explicit(&tb->table[t], table, memory_order_release);
+      }
+      UNLOCK(mutex);
     }
-    UNLOCK(mutex);
-  }
 
-  if (!table->precomp)
-    return (int)((struct TbTableConst *)table)->constVal
-      + (type == WDL ? -2 : 0);
+    if (!table->precomp)
+      return (int)((struct TbTableConst *)table)->constVal
+        + (type == WDL ? -2 : 0);
 
-  // Normalize the position.
-  uint8_t mask = MirrorMask[p[0]];
-  for (int i = 0; i < entry->num; i++)
-    p[i] = p[i] ^ mask;
-
-  if (FlipTest[p[0]][p[1]])
+    // Normalize the position.
+    uint8_t mask = MirrorMask[p[0]];
     for (int i = 0; i < entry->num; i++)
-      p[i] = FlipDiag[p[i]];
+      p[i] = p[i] ^ mask;
 
-  // Calculate index.
-  uint64_t idx = 0;
-  Bitboard occ = bit(p[0]) | bit(p[1]);
-  for (int k = 0; k < entry->numsets; k++) {
-    int m = table->first[k];
-    sort_squares(table->mult[k], &p[m]);
-    size_t s = 0;
-    Bitboard occ2 = occ;
-    for (int i = 0; i < table->mult[k]; i++, m++) {
-      int rank = rank_among_free(p[m], occ);
-      occ2 |= bit(p[m]);
-      s += Binomial[i + 1][rank];
+    if (FlipTest[p[0]][p[1]])
+      for (int i = 0; i < entry->num; i++)
+        p[i] = FlipDiag[p[i]];
+
+    // Calculate index.
+    uint64_t idx = 0;
+    Bitboard occ = bit(p[0]) | bit(p[1]);
+    for (int k = 0; k < entry->numsets; k++) {
+      int m = table->first[k];
+      sort_squares(table->mult[k], &p[m]);
+      size_t s = 0;
+      Bitboard occ2 = occ;
+      for (int i = 0; i < table->mult[k]; i++, m++) {
+        int rank = rank_among_free(p[m], occ);
+        occ2 |= bit(p[m]);
+        s += Binomial[i + 1][rank];
+      }
+      idx = idx * table->factor[k] + s;
+      occ = occ2;
     }
-    idx = idx * table->factor[k] + s;
-    occ = occ2;
-  }
 
-  TB_ProbeCount[type]++;
+    TB_ProbeCount[type]++;
 
-  const uint8_t *w = decompress_pairs(table->precomp, idx);
+    const uint8_t *w = decompress_pairs(table->precomp, idx);
 
-  if (type == WDL)
-    return (int)w[0] - 2;
+    if (type == WDL)
+      return (int)w[0] - 2;
 
-  int v = read_le_u16(w) & 0xfff;
+    int v = read_le_u16(w) & 0xfff;
 
-  if (type == DTM) {
-    struct DtmTable2 *dtm = (struct DtmTable2 *)table;
-    if (dtm->mapped)
-      v = from_le_u16(dtm->dtmMap[dtm->dtmMapIdx[s] + v]);
-  }
-
-  if (type == DTZ) {
-    struct DtzTable2 *dtz = (struct DtzTable2 *)table;
-    if (dtz->mapped) {
-      int m = WdlToMap[s + 2];
-      v = dtz->mapped == 1 ? dtz->dtzMap  [dtz->dtzMapIdx[m] + v]
-                           : dtz->dtzMap16[dtz->dtzMapIdx[m] + v];
+    if (type == DTM) {
+      struct DtmTable2 *dtm = (struct DtmTable2 *)table;
+      if (dtm->mapped)
+        v = from_le_u16(dtm->dtmMap[dtm->dtmMapIdx[s] + v]);
     }
-    if (s & 1)
-      v *= 2;
-  }
 
-  return v;
+    if (type == DTZ) {
+      struct DtzTable2 *dtz = (struct DtzTable2 *)table;
+      if (dtz->mapped) {
+        int m = WdlToMap[s + 2];
+        v = dtz->mapped == 1 ? dtz->dtzMap  [dtz->dtzMapIdx[m] + v]
+                             : dtz->dtzMap16[dtz->dtzMapIdx[m] + v];
+      }
+      if (s & 1)
+        v *= 2;
+    }
+
+    return v;
+  }
 }
 
 static NOINLINE int probe_wdl_table(TB_Position *pos, int *result)
