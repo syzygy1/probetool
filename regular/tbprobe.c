@@ -1626,7 +1626,8 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
     int num = layout == LT_PIECE ? 1 : layout == LT_PIECE_K ? 10 : 462;
     num *= 1 + two_sided;
 
-    struct Tbase *tbase = malloc(sizeof(struct Tbase) + num * sizeof(void *));
+    struct Tbase *tbase =
+      calloc(1, sizeof(struct Tbase) + num * sizeof(void *));
     tbase->data = data;
     tbase->mapping = mapping;
     tbase->layout = layout;
@@ -1712,6 +1713,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
         dtz->dtzMapIdx[i] = data + 1 - dtz->dtzMap;
         data += 1 + data[0];
       }
+      data += (uintptr_t)data & 1;
     } else if (mapped == 2) {
       dtz->dtzMap16 = (uint16_t *)data;
       for (int i = 0; i < 4; i++) {
@@ -1996,6 +1998,14 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     return v;
 
   } else { /* PIECE_KK */
+
+    if (   (type == DTZ || type == DTM)
+        && (   (tb->distFormat == WL_WTM && btm_side)
+            || (tb->distFormat == WL_BTM && !btm_side)))
+    {
+      *result = CHANGE_STM;
+      return 0;
+    }
 
     struct TbTable2 *table;
     TB_list_squares(pos, tb->pt, flip, p);
