@@ -1397,7 +1397,7 @@ static struct PairsData *setup_rans(const uint8_t **ptr)
 
   int num_syms;
   d->rans = calloc(1, sizeof(struct RansDecode));
-  const uint8_t *p = read_freq_table(d->rans, &num_syms, data + 10);
+  const uint8_t *p = read_freq_table(d->rans, &num_syms, data + 8);
 //  d->num_syms = num_syms;
   make_alias_table(d->rans);
 
