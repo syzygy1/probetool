@@ -535,10 +535,11 @@ static const size_t TABLE_SIZE2[3] = {
 struct TbTableConst {
   struct PairsData *precomp;
   uint16_t constVal;
+  uint8_t distFormat;
 };
 
 static const struct TbTableConst constTable[5] = {
-  { NULL, 0 }, { NULL, 1 }, { NULL, 2 }, { NULL, 3 }, { NULL, 4 }
+  { NULL, 0, 0 }, { NULL, 1, 0 }, { NULL, 2, 0 }, { NULL, 3, 0 }, { NULL, 4, 0 }
 };
 
 // For an old-format file, we allocate and initialize all 1/2/4/6/8/12
@@ -680,11 +681,10 @@ static void detect_tb(char *str)
   entry->hasPawns = pcs[1] || pcs[9];
   entry->key = key;
   entry->symmetric = key == key2;
-  for (int i = 0; i < 16; i++) {
+  for (int i = 0; i < 16; i++)
     entry->num += pcs[i];
-    entry->numsets += pcs[i] != 0;
-  }
-  entry->numsets -= 2;
+  for (int i = 2; i < 6; i++)
+    entry->numsets += (pcs[i] != 0) + (pcs[i + 8] != 0);
 
   TB_NumTables[WDL]++;
   TB_NumTables[DTM] += entry->hasDtm = test_tb(str, suffix[DTM]);
@@ -1696,16 +1696,10 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
              : layout == LT_PAWN_PP  ? 576 : 1128;
     p = (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7);
     if (!entry->symmetric) {
-      if (type == WDL)
-        num *= 2;
-      else if (layout <= LT_PIECE_KK)
+      if (type != WDL && layout <= LT_PIECE_KK)
         num *= (distFormat & TWO_SIDED) ? 1 : 2;
-      else if (layout <= LT_PAWN_PK) {
-        uint32_t w;
-        memcpy(&w, p, 4);
-        num = (24 + __builtin_popcountg(w)) * num / 24;
-      }
-      // TODO: LT_PAWN_PP, LT_PAWN_PvP
+      else
+        num *= 2;
     }
 
     struct Tbase *tbase = calloc(1, sizeof *tbase + num * sizeof(void *));
@@ -1714,12 +1708,15 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
     tbase->layout = layout;
     if (type != WDL && layout <= LT_PIECE_KK)
       tbase->distFormat = distFormat;
-    tbase->flipped = false; // May need changes for pawnful tables.
-    tbase->offset = p - data;
+    tbase->offset = (uint64_t *)p - (uint64_t *)data;
     tbase->pt[0] = 6;
     tbase->pt[1] = 14;
     for (int i = 2; i < entry->num; i++)
       tbase->pt[i] = (data[4 + i] & 0x07) | ((data[4 + i] & 0x80) >> 4);
+    int c[16] = { 0 };
+    for (int i = 0; i < entry->num; i++)
+      c[tbase->pt[i]]++;
+    tbase->flipped = TB_material_key_from_counts(c, c + 8) != entry->key;
     return tbase;
   }
 
@@ -1731,20 +1728,29 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
 static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
     struct Tbase *tb, int type, int tidx, int tsq)
 {
-  const uint64_t *offsets = (uint64_t *)((uint8_t *)tb->data + tb->offset);
+  const uint64_t *offsets = (uint64_t *)tb->data + tb->offset;
+  if (offsets[tidx] == 0)
+    return (struct TbTable2 *)1;
   const uint8_t *data = (uint8_t *)tb->data + offsets[tidx];
 
   if (data[0] == 0xff) {
     if (data[1] >= 5) {
       struct TbTableConst *tbl = malloc(sizeof *tbl);
-      *tbl = (struct TbTableConst){ .precomp = NULL, .constVal = data[1] };
+      *tbl = (struct TbTableConst){
+        .precomp = NULL, .constVal = data[1], .distFormat = data[2]
+      };
       return (struct TbTable2 *)tbl;
     }
     return (struct TbTable2 *)&constTable[data[1]];
   }
 
   struct TbTable2 *table = malloc(TABLE_SIZE2[type]);
-  int mapped = *data++;
+
+  int mapped, distFormat;
+  if (type != WDL) {
+    mapped = *data++;
+    distFormat = *data++;
+  }
 
   uint8_t first[TB_SETS];
   uint8_t mult[TB_SETS];
@@ -1761,7 +1767,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
   }
 
   static const uint8_t knum[] = { 58, 58, 58, 55, 55, 55, 33, 30, 30, 30 };
-  // FIXME: LT_PAWN_P/_PK
+  // FIXME: LT_PAWN_PK
   uint64_t tb_size = 1;
   if (tb->layout == LT_PIECE_KK) {
     for (int i = 0, n = 62; i < k; i++) {
@@ -1790,6 +1796,24 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
     }
     data += k + 1;
   }
+  else if (tb->layout == LT_PAWN_P) {
+    for (int i = 0, n = 63; i < k + 1; i++) {
+      int l = data[i];
+      if (l < 2) {
+        table->first[i] = l;
+        table->mult[i] = 1;
+      } else {
+        table->first[i] = first[l - 1];
+        table->mult[i] = mult[l - 1];
+      }
+      table->factor[i] = Binomial[table->mult[i]][n];
+      n -= table->mult[i];
+      tb_size *= table->factor[i];
+    }
+    data += k + 1;
+  }
+  else if (tb->layout == LT_PAWN_PK) {
+  }
   data += (uintptr_t)data & 1;
 
   size_t size[3];
@@ -1798,6 +1822,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
   if (type == DTM) {
     struct DtmTable2 *dtm = (struct DtmTable2 *)table;
     dtm->mapped = mapped;
+    dtm->distFormat = distFormat;
     if (mapped) {
       dtm->dtmMap = (uint16_t *)data;
       for (int i = 0; i < 2; i++) {
@@ -1810,6 +1835,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
   if (type == DTZ) {
     struct DtzTable2 *dtz = (struct DtzTable2 *)table;
     dtz->mapped = mapped;
+    dtz->distFormat = distFormat;
     if (mapped == 1) {
       dtz->dtzMap = data;
       for (int i = 0; i < 4; i++) {
@@ -2002,14 +2028,13 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     UNLOCK(mutex);
   }
 
-  if (type == DTM || (type == DTZ && tb->layout < LT_PAWN_P)) {
-    if (   (tb->distFormat & WIN_OR_LOSS)
-        && (bool)(tb->distFormat & WIN_ONLY) != (s > 0))
-    {
-      // A 1-ply search is needed.
-      *result = CHANGE_STM;
-      return 0;
-    }
+  if (   (type == DTM || (type == DTZ && tb->layout <= LT_PIECE_KK))
+      && (tb->distFormat & WIN_OR_LOSS)
+      && (bool)(tb->distFormat & WIN_ONLY) != (s > 0))
+  {
+    // A 1-ply search is needed.
+    *result = CHANGE_STM;
+    return 0;
   }
 
   uint8_t p[TB_PIECES];
@@ -2092,7 +2117,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
 
   } else { /* PIECE_K || PIECE_KK || PAWN_P || PAWN_PK || PAWN_PvP || PAWN_PP */
 
-    if (   (type == DTZ || type == DTM)
+    if (   (type == DTM || (type == DTZ && tb->layout <= LT_PIECE_KK))
         && (tb->distFormat & WTM_OR_BTM)
         && (bool)(tb->distFormat & WTM_ONLY) == btm_side)
     {
@@ -2135,18 +2160,18 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
         for (int i = 0; i < entry->num; i++)
           p[i] ^= 0x07;
 
-      occ = bit(p[0]) | bit(p[1]) | bit(p[2]);
-
       if (tb->layout == LT_PAWN_P) {
-//        idx = OffP[p[btm_side]];
+        occ = bit(p[2]);
         tsq = Flap[0][p[2]];
+        t = !entry->symmetric ? 2 * tsq + btm_side : tsq;
       } else {
         if (btm_side)
           Swap(p[0], p[1]);
-        tsq = Flap[0][p[2]] * 63 + p[0] - (p[0] > p[2]);
+        int psq = Flap[0][p[2]];
+        tsq = psq * 63 + p[0] - (p[0] > p[2]);
+        occ = bit(p[0]) | bit(p[2]);
         // TODO: p[1] to be used in index calculation
       }
-      t = 0;
 
     } else {
       t = tsq = 0;
@@ -2164,12 +2189,40 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
       UNLOCK(mutex);
     }
 
-    if (!table->precomp)
+    if ((uintptr_t)table == 1) {
+      *result = CHANGE_STM;
+      return 0;
+    }
+
+    if (!table->precomp) {
+      struct TbTableConst *tbl = (struct TbTableConst *)table;
+      if (    type != WDL
+          && tbl->distFormat
+          && (bool)(tbl->distFormat & WIN_ONLY) != (s > 0))
+        *result = CHANGE_STM;
       return (int)((struct TbTableConst *)table)->constVal
         + (type == WDL ? -2 : 0);
+    }
+
+    if (type == DTM) {
+      struct DtmTable2 *dtm = (struct DtmTable2 *)table;
+      if (dtm->distFormat && (bool)(dtm->distFormat & WIN_ONLY) != (s > 0)) {
+        *result = CHANGE_STM;
+        return 0;
+      }
+    }
+
+    if (type == DTZ) {
+      struct DtzTable2 *dtz = (struct DtzTable2 *)table;
+      if (dtz->distFormat && (bool)(dtz->distFormat & WIN_ONLY) != (s > 0)) {
+        *result = CHANGE_STM;
+        return 0;
+      }
+    }
 
     // Calculate index.
-    int numsets = entry->numsets + (tb->layout == LT_PIECE_K);
+    static const int extra[] = { 1, 0, 2, 1, 0, 0 };
+    int numsets =  entry->numsets + extra[tb->layout - LT_PIECE_K];
     for (int k = 0; k < numsets; k++) {
       size_t s = 0;
       if (table->mult[k] == 0)
