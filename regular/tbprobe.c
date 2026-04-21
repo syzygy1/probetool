@@ -1734,7 +1734,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
   const uint8_t *data = (uint8_t *)tb->data + offsets[tidx];
 
   if (data[0] == 0xff) {
-    if (data[1] >= 5) {
+    if (type != WDL) {
       struct TbTableConst *tbl = malloc(sizeof *tbl);
       *tbl = (struct TbTableConst){
         .precomp = NULL, .constVal = data[1], .distFormat = data[2]
@@ -1749,7 +1749,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
   int mapped, distFormat;
   if (type != WDL) {
     mapped = *data++;
-    distFormat = *data++;
+    distFormat = tb->layout >= LT_PAWN_P ? *data++ : 0;
   }
 
   uint8_t first[TB_SETS];
