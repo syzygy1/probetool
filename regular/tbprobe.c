@@ -739,7 +739,7 @@ static void free_tbase(struct TbEntry *entry, struct Tbase *tb)
   for (int i = 0; i < num; i++) {
     struct TbTable *table = atomic_load_explicit(&tb->table[i],
         memory_order_relaxed);
-    if (table) free_tb_table(table);
+    if ((uintptr_t)table > 1) free_tb_table(table);
   }
   free(tb);
 }
