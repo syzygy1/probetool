@@ -1767,7 +1767,6 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
   }
 
   static const uint8_t knum[] = { 58, 58, 58, 55, 55, 55, 33, 30, 30, 30 };
-  // FIXME: LT_PAWN_PK
   uint64_t tb_size = 1;
   if (tb->layout == LT_PIECE_KK) {
     for (int i = 0, n = 62; i < k; i++) {
@@ -1813,6 +1812,20 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
     data += k + 1;
   }
   else if (tb->layout == LT_PAWN_PK) {
+    for (int i = 0, n = 62; i < k; i++) {
+      int l = data[i];
+      if (l == 0) {
+        table->first[i] = 1;
+        table->mult[i] = 1;
+      } else {
+        table->first[i] = first[l];
+        table->mult[i] = mult[l];
+      }
+      table->factor[i] = Binomial[table->mult[i]][n];
+      n -= table->mult[i];
+      tb_size *= table->factor[i];
+    }
+    data += k;
   }
   data += (uintptr_t)data & 1;
 
@@ -1843,7 +1856,8 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
         data += 1 + data[0];
       }
       data += (uintptr_t)data & 1;
-    } else if (mapped == 2) {
+    }
+    else if (mapped == 2) {
       dtz->dtzMap16 = (uint16_t *)data;
       for (int i = 0; i < 4; i++) {
         dtz->dtzMapIdx[i] = (uint16_t *)data + 1 - dtz->dtzMap16;
@@ -2163,15 +2177,13 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
       if (tb->layout == LT_PAWN_P) {
         occ = bit(p[2]);
         tsq = Flap[0][p[2]];
-        t = !entry->symmetric ? 2 * tsq + btm_side : tsq;
       } else {
         if (btm_side)
           Swap(p[0], p[1]);
-        int psq = Flap[0][p[2]];
-        tsq = psq * 63 + p[0] - (p[0] > p[2]);
+        tsq = Flap[0][p[2]] * 63 + p[0] - (p[0] > p[2]);
         occ = bit(p[0]) | bit(p[2]);
-        // TODO: p[1] to be used in index calculation
       }
+      t = !entry->symmetric ? 2 * tsq + btm_side : tsq;
 
     } else {
       t = tsq = 0;
@@ -2189,7 +2201,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
       UNLOCK(mutex);
     }
 
-    if ((uintptr_t)table == 1) {
+    if (type != WDL && (uintptr_t)table == 1) {
       *result = CHANGE_STM;
       return 0;
     }
