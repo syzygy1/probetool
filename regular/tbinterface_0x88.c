@@ -123,7 +123,7 @@ struct State {
 
 typedef uint16_t Move;
 
-// Board representation for up to 7 pieces.
+// Board representation for up to 8 pieces.
 // The number N of pieces is stored in num.
 // The squares of the pieces in 0x88 encoding (A1=0, H1=7, A2=16, H8=119)
 // are listed in sq[0..N-1].
@@ -145,8 +145,8 @@ typedef uint16_t Move;
 // 50-move clock.
 struct TB_Position {
   int8_t bd[120];
-  uint8_t sq[8];
-  uint8_t pt[8];
+  uint8_t sq[9];
+  uint8_t pt[9];
   int num;
   int stm;
   int idx;
@@ -212,7 +212,7 @@ INLINE bool piece_attacks(TB_Position *pos, int i, int to)
 TB_Position *TBitf_alloc_position(void)
 {
   TB_Position *pos = malloc(sizeof *pos);
-  pos->maxIdx = 7;
+  pos->maxIdx = 8;
   pos->maxMoves = 500;
   pos->state = malloc(pos->maxIdx * sizeof(struct State));
   pos->move = malloc(pos->maxMoves * sizeof(Move));
@@ -570,7 +570,7 @@ void TBitf_set_from_fen(TB_Position *pos, const char *fen, int *cnt50)
     else if (c == 'K' || c == 'k')
       goto illegal_fen;
     else if (strchr(pieceChar, c)) {
-      if (pos->num == 7)
+      if (pos->num == 8)
         goto too_many_pieces;
       pos->pt[pos->num] = strchr(pieceChar, c) - pieceChar;
       pos->sq[pos->num++] = (r << 4) | f++;

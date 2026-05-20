@@ -815,8 +815,8 @@ void TB_init(const char *pathList)
   for (int i = 0; i < (1 << TB_HASHBITS); i++)
     tbHash[i] = (struct HashEntry){ 0 };
 
-  char str[16];
-  int i, j, k, l, m;
+  char str[32];
+  int i, j, k, l, m, n;
 
   for (i = 0; i < 5; i++) {
     sprintf(str, "K%cvK", pchr(i));
@@ -903,6 +903,17 @@ void TB_init(const char *pathList)
             sprintf(str, "K%c%c%cvK%c%c", pchr(i), pchr(j), pchr(k), pchr(l), pchr(m));
             detect_tb(str);
           }
+
+  for (i = 0; i < 5; i++)
+    for (j = i; j < 5; j++)
+      for (k = j; k < 5; k++)
+        for (l = k; l < 5; l++)
+          for (m = l; m < 5; m++)
+            for (n = m; n < 5; n++) {
+              sprintf(str, "K%c%c%c%c%c%cvK", pchr(i), pchr(j), pchr(k), pchr(l), pchr(m), pchr(n));
+              detect_tb(str);
+            }
+
 }
 
 static const int8_t OffDiag[] = {
