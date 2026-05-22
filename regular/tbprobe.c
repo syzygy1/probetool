@@ -595,6 +595,8 @@ static char PieceToChar[] = {
   0, 'P', 'N', 'B', 'R', 'Q', 'K', 0
 };
 
+static uint32_t Binomial[8][64];
+
 static FD open_tb(const char *str, const char *suffixStr)
 {
   char name[256];
@@ -651,7 +653,6 @@ static void add_to_hash(void *ptr, uint64_t key)
   tbHash[idx].ptr = ptr;
 }
 
-#define pchr(i) PieceToChar[5 - (i)]
 #define Swap(a,b) {int tmp=a;a=b;b=tmp;}
 
 static void detect_tb(char *str)
@@ -765,6 +766,20 @@ void TB_release(void)
     free_tb_entry(&tbEntry[i]);
 }
 
+static void create_piece_string(char *s, int n, uint32_t idx)
+{
+  s[n] = 0;
+  if (n == 0) return;
+  for (int k = n - 1; k > 0; k--) {
+    int l = 0;
+    while (idx >= Binomial[k + 1][k + 1 + l])
+      l++;
+    idx -= Binomial[k + 1][k + l];
+    s[n - 1 - k] = PieceToChar[l + 1];
+  }
+  s[n - 1] = PieceToChar[idx + 1];
+}
+
 void TB_init(const char *pathList)
 {
   if (!initialized) {
@@ -815,105 +830,19 @@ void TB_init(const char *pathList)
   for (int i = 0; i < (1 << TB_HASHBITS); i++)
     tbHash[i] = (struct HashEntry){ 0 };
 
-  char str[32];
-  int i, j, k, l, m, n;
+  char white[16], black[16], name[40];
 
-  for (i = 0; i < 5; i++) {
-    sprintf(str, "K%cvK", pchr(i));
-    detect_tb(str);
-  }
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++) {
-      sprintf(str, "K%cvK%c", pchr(i), pchr(j));
-      detect_tb(str);
-    }
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++) {
-      sprintf(str, "K%c%cvK", pchr(i), pchr(j));
-      detect_tb(str);
-    }
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++)
-      for (k = 0; k < 5; k++) {
-        sprintf(str, "K%c%cvK%c", pchr(i), pchr(j), pchr(k));
-        detect_tb(str);
+  for (int p = 1; p <= 6; p++)
+    for (int q = 0; q <= min(p, 6 - p); q++)
+      for (int k = Binomial[4][p + 4] - 1; k >= 0; k--) {
+        create_piece_string(white, p, k);
+        for (int l = q < p ? (int)Binomial[4][q + 4] - 1 : k; l >= 0; l--) {
+          create_piece_string(black, q, l);
+          printf("%s\n", name);
+          sprintf(name, "K%svK%s", white, black);
+          detect_tb(name);
+        }
       }
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++)
-      for (k = j; k < 5; k++) {
-        sprintf(str, "K%c%c%cvK", pchr(i), pchr(j), pchr(k));
-        detect_tb(str);
-      }
-
-  // 6- and 7-piece TBs make sense only with a 64-bit address space
-  if (sizeof(size_t) < 8)
-    return;
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++)
-      for (k = i; k < 5; k++)
-        for (l = (i == k) ? j : k; l < 5; l++) {
-          sprintf(str, "K%c%cvK%c%c", pchr(i), pchr(j), pchr(k), pchr(l));
-          detect_tb(str);
-        }
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++)
-      for (k = j; k < 5; k++)
-        for (l = 0; l < 5; l++) {
-          sprintf(str, "K%c%c%cvK%c", pchr(i), pchr(j), pchr(k), pchr(l));
-          detect_tb(str);
-        }
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++)
-      for (k = j; k < 5; k++)
-        for (l = k; l < 5; l++) {
-          sprintf(str, "K%c%c%c%cvK", pchr(i), pchr(j), pchr(k), pchr(l));
-          detect_tb(str);
-        }
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++)
-      for (k = j; k < 5; k++)
-        for (l = k; l < 5; l++)
-          for (m = l; m < 5; m++) {
-            sprintf(str, "K%c%c%c%c%cvK", pchr(i), pchr(j), pchr(k), pchr(l), pchr(m));
-            detect_tb(str);
-          }
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++)
-      for (k = j; k < 5; k++)
-        for (l = k; l < 5; l++)
-          for (m = 0; m < 5; m++) {
-            sprintf(str, "K%c%c%c%cvK%c", pchr(i), pchr(j), pchr(k), pchr(l), pchr(m));
-            detect_tb(str);
-          }
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++)
-      for (k = j; k < 5; k++)
-        for (l = 0; l < 5; l++)
-          for (m = l; m < 5; m++) {
-            sprintf(str, "K%c%c%cvK%c%c", pchr(i), pchr(j), pchr(k), pchr(l), pchr(m));
-            detect_tb(str);
-          }
-
-  for (i = 0; i < 5; i++)
-    for (j = i; j < 5; j++)
-      for (k = j; k < 5; k++)
-        for (l = k; l < 5; l++)
-          for (m = l; m < 5; m++)
-            for (n = m; n < 5; n++) {
-              sprintf(str, "K%c%c%c%c%c%cvK", pchr(i), pchr(j), pchr(k), pchr(l), pchr(m), pchr(n));
-              detect_tb(str);
-            }
-
 }
 
 static const int8_t OffDiag[] = {
@@ -1096,7 +1025,6 @@ static const uint8_t FileToFile[8] = { 0, 1, 2, 3, 3, 2, 1, 0 };
 static const int WdlToMap[5] = { 1, 3, 0, 2, 0 };
 static const uint8_t PAFlags[5] = { 8, 0, 0, 0, 4 };
 
-static uint32_t Binomial[8][64];
 static size_t PawnIdx[2][6][24];
 static size_t PawnFactorFile[6][4];
 static size_t PawnFactorRank[6][6];
