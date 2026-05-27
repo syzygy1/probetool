@@ -838,7 +838,6 @@ void TB_init(const char *pathList)
         create_piece_string(white, p, k);
         for (int l = q < p ? (int)Binomial[4][q + 4] - 1 : k; l >= 0; l--) {
           create_piece_string(black, q, l);
-          printf("%s\n", name);
           sprintf(name, "K%svK%s", white, black);
           detect_tb(name);
         }
@@ -1685,7 +1684,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
 
   struct TbTable2 *table = malloc(TABLE_SIZE2[type]);
 
-  int mapped, distFormat;
+  int mapped = 0, distFormat;
   if (type != WDL) {
     mapped = *data++;
     distFormat = tb->layout >= LT_PAWN_P ? *data++ : 0;
