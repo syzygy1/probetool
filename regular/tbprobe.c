@@ -402,19 +402,7 @@ enum { WDL = TB_WDL, DTM = TB_DTM, DTZ = TB_DTZ };
 //enum { WL_BOTH = 0, WL_WTM, WL_BTM, W_ONLY, L_ONLY };
 enum {
   LT_PIECE = 0, LT_PAWN_FILE, LT_PAWN_RANK,
-  LT_PIECE_K, LT_PIECE_KK, LT_PIECE_KK2,
-  LT_PAWN_P, LT_PAWN_PK, LT_PAWN_PP, LT_PAWN_PvP
-};
-
-uint8_t layout_v1[] = {
-  LT_PIECE, LT_PAWN_FILE, LT_PAWN_RANK,
   LT_PIECE_K, LT_PIECE_KK,
-  LT_PAWN_P, LT_PAWN_PK, LT_PAWN_PP, LT_PAWN_PvP
-};
-
-uint8_t layout_v2[] = {
-  LT_PIECE, LT_PAWN_FILE, LT_PAWN_RANK,
-  LT_PIECE_K, LT_PIECE_KK2,
   LT_PAWN_P, LT_PAWN_PK, LT_PAWN_PP, LT_PAWN_PvP
 };
 
@@ -573,6 +561,7 @@ struct Tbase {
   uint8_t pt[TB_PIECES];
   uint8_t layout;
   uint8_t distFormat;
+  uint8_t version;
   bool flipped;
   uint8_t offset;
   void *_Atomic table[];
@@ -1988,22 +1977,17 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
 
     const uint8_t *p = data + 4 + entry->num;
     int layout = *p++;
-    if (version == 1)
-      layout = layout_v1[layout];
-    else
-      layout = layout_v2[layout];
     int distFormat;
-    if (type != WDL && layout <= LT_PIECE_KK2)
+    if (type != WDL && layout <= LT_PIECE_KK)
       distFormat = *p++;
     int num =  layout == LT_PIECE_K   ? 10
              : layout == LT_PIECE_KK  ? 462
-             : layout == LT_PIECE_KK2 ? 462
              : layout == LT_PAWN_P    ? 24
              : layout == LT_PAWN_PK   ? 1512
              : layout == LT_PAWN_PP   ? 576 : 1128;
     p = (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7);
     if (!entry->symmetric) {
-      if (type != WDL && layout <= LT_PIECE_KK2)
+      if (type != WDL && layout <= LT_PIECE_KK)
         num *= (distFormat & TWO_SIDED) ? 2 : 1;
       else
         num *= 2;
@@ -2012,8 +1996,9 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
     struct Tbase *tbase = calloc(1, sizeof *tbase + num * sizeof(void *));
     tbase->data = data;
     tbase->mapping = mapping;
+    tbase->version = version;
     tbase->layout = layout;
-    if (type != WDL && layout <= LT_PIECE_KK2)
+    if (type != WDL && layout <= LT_PIECE_KK)
       tbase->distFormat = distFormat;
     tbase->offset = (uint64_t *)p - (uint64_t *)data;
     tbase->pt[0] = 6;
@@ -2075,7 +2060,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
 
   static const uint8_t knum[] = { 58, 58, 58, 55, 55, 55, 33, 30, 30, 30 };
   uint64_t tb_size = 1;
-  if (tb->layout == LT_PIECE_KK || tb->layout == LT_PIECE_KK2) {
+  if (tb->layout == LT_PIECE_KK || tb->layout == LT_PIECE_KK) {
     for (int i = 0, n = 62; i < k; i++) {
       table->first[i] = first[data[i]];
       int m = mult[data[i]];
@@ -2084,7 +2069,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
       tb_size *= table->factor[i];
       n -= m;
     }
-    if (tb->layout == LT_PIECE_KK2 && tsq >= 441) {
+    if (tb->layout == LT_PIECE_KK && tsq >= 441 && tb->version >= 2) {
       table->part_id = find_partition(k, mult);
       tb_size = reflection_size[table->part_id];
     }
@@ -2353,7 +2338,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     UNLOCK(mutex);
   }
 
-  if (   (type == DTM || (type == DTZ && tb->layout <= LT_PIECE_KK2))
+  if (   (type == DTM || (type == DTZ && tb->layout <= LT_PIECE_KK))
       && (tb->distFormat & WIN_OR_LOSS)
       && (bool)(tb->distFormat & WIN_ONLY) != (s > 0))
   {
@@ -2442,7 +2427,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
 
   } else { /* PIECE_K || PIECE_KK || PAWN_P || PAWN_PK || PAWN_PvP || PAWN_PP */
 
-    if (   (type == DTM || (type == DTZ && tb->layout <= LT_PIECE_KK2))
+    if (   (type == DTM || (type == DTZ && tb->layout <= LT_PIECE_KK))
         && (tb->distFormat & WTM_OR_BTM)
         && (bool)(tb->distFormat & WTM_ONLY) == btm_side)
     {
@@ -2456,7 +2441,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     int t, tsq;
     uint64_t idx = 0;
     Bitboard occ;
-    if (tb->layout <= LT_PIECE_KK2) {
+    if (tb->layout <= LT_PIECE_KK) {
 
       if (tb->layout == LT_PIECE_K && btm_side)
         Swap(p[0], p[1]);
@@ -2543,7 +2528,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
       }
     }
 
-    if (tb->layout != LT_PIECE_KK2 || tsq < 441) {
+    if (tb->layout != LT_PIECE_KK || tsq < 441 || tb->version == 1) {
       // Calculate index.
       static const int extra[] = { 1, 0, 0, 2, 1, 0, 0 };
       int numsets =  entry->numsets + extra[tb->layout - LT_PIECE_K];
