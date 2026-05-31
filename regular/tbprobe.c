@@ -1394,9 +1394,9 @@ static uint64_t rank_reflection(uint8_t *restrict sq, Bitboard occ,
     if (comp < orient_mask) {
       for (int i = 2; i < TB_PIECES; i++)
         sq[i] = FlipDiag[sq[i]];
-      bb = flip_main_diag(bb);
+      occ = flip_main_diag(occ);
     }
-    return rank + rank_trivial_from(sq, k + 1, occ | bb, numsets, table);
+    return rank + rank_trivial_from(sq, k + 1, occ, numsets, table);
   }
   return rank;
 }
@@ -2084,7 +2084,10 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
       tb_size *= table->factor[i];
       n -= m;
     }
-    table->part_id = find_partition(k, mult);
+    if (tb->layout == LT_PIECE_KK2 && tsq >= 441) {
+      table->part_id = find_partition(k, mult);
+      tb_size = reflection_size[table->part_id];
+    }
     data += k;
   }
   else if (tb->layout == LT_PIECE_K) {
