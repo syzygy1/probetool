@@ -2528,9 +2528,9 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
       }
     }
 
+    // Calculate index.
     if (tb->layout != LT_PIECE_KK || tsq < 441 || tb->version == 1) {
-      // Calculate index.
-      static const int extra[] = { 1, 0, 0, 2, 1, 0, 0 };
+      static const int extra[] = { 1, 0, 2, 1, 0, 0 };
       int numsets =  entry->numsets + extra[tb->layout - LT_PIECE_K];
       for (int k = 0; k < numsets; k++) {
         size_t s = 0;
