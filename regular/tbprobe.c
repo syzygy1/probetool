@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #endif
+#include <x86intrin.h>
 
 #include "tbprobe.h"
 #include "tbinterface.h"
@@ -31,7 +32,7 @@
 
 typedef uint64_t Bitboard;
 
-INLINE int popcount(Bitboard b)
+INLINE int popcnt(Bitboard b)
 {
   return __builtin_popcountll(b);
 }
@@ -401,7 +402,19 @@ enum { WDL = TB_WDL, DTM = TB_DTM, DTZ = TB_DTZ };
 //enum { WL_BOTH = 0, WL_WTM, WL_BTM, W_ONLY, L_ONLY };
 enum {
   LT_PIECE = 0, LT_PAWN_FILE, LT_PAWN_RANK,
+  LT_PIECE_K, LT_PIECE_KK, LT_PIECE_KK2,
+  LT_PAWN_P, LT_PAWN_PK, LT_PAWN_PP, LT_PAWN_PvP
+};
+
+uint8_t layout_v1[] = {
+  LT_PIECE, LT_PAWN_FILE, LT_PAWN_RANK,
   LT_PIECE_K, LT_PIECE_KK,
+  LT_PAWN_P, LT_PAWN_PK, LT_PAWN_PP, LT_PAWN_PvP
+};
+
+uint8_t layout_v2[] = {
+  LT_PIECE, LT_PAWN_FILE, LT_PAWN_RANK,
+  LT_PIECE_K, LT_PIECE_KK2,
   LT_PAWN_P, LT_PAWN_PK, LT_PAWN_PP, LT_PAWN_PvP
 };
 
@@ -448,7 +461,9 @@ struct PairsData {
   uint64_t base[]; // must be base[1] in C++
 };
 
-// TODO: include the PairsData struct in the DataTable struct.
+// TODO: Instead of including indexing info in each TbTable2 struct,
+// use an identifier that identifies a precomputed index struct.
+// Perhaps also for TbTable structs.
 
 struct EncInfo {
   size_t factor[TB_PIECES];
@@ -490,6 +505,7 @@ struct TbTable2 {
   uint32_t factor[TB_SETS];
   uint8_t first[TB_SETS];
   uint8_t mult[TB_SETS];
+  uint8_t part_id;
 };
 
 struct WdlTable2 {
@@ -497,6 +513,7 @@ struct WdlTable2 {
   uint32_t factor[TB_SETS];
   uint8_t first[TB_SETS];
   uint8_t mult[TB_SETS];
+  uint8_t part_id;
 };
 
 struct DtmTable2 {
@@ -504,6 +521,7 @@ struct DtmTable2 {
   uint32_t factor[TB_SETS];
   uint8_t first[TB_SETS];
   uint8_t mult[TB_SETS];
+  uint8_t part_id;
   uint8_t mapped;
   uint8_t distFormat;
   uint16_t dtmMapIdx[2];
@@ -515,6 +533,7 @@ struct DtzTable2 {
   uint32_t factor[TB_SETS];
   uint8_t first[TB_SETS];
   uint8_t mult[TB_SETS];
+  uint8_t part_id;
   uint8_t mapped;
   uint8_t distFormat;
   uint16_t dtzMapIdx[4];
@@ -1035,6 +1054,353 @@ static bool FlipTest[64][64];
 static uint8_t Off10[10][64];
 //static int16_t TableP[24][64];
 
+
+// Perfect indexing code for positions with Ks on the diagonal starts here.
+
+typedef uint64_t Bitboard;
+
+INLINE int lsb(Bitboard b)
+{
+  return __builtin_ctzll(b);
+}
+
+INLINE int pop_lsb(Bitboard *b)
+{
+  int s = lsb(*b);
+  *b &= *b - 1;
+  return s;
+}
+
+INLINE int rank_among_free(uint8_t sq, uint64_t occ)
+{
+  return sq - popcnt(occ & ((1ULL << sq) - 1));
+}
+
+static const uint8_t partition[30][7] = {
+  { 0 },
+  { 1 },
+  { 2 }, { 1, 1},
+  { 3 }, { 2, 1}, { 1, 1, 1 },
+  { 4 }, { 3, 1}, { 2, 2 }, { 2, 1, 1 }, { 1, 1, 1, 1 },
+  { 5 }, { 4, 1}, { 3, 2 }, { 3, 1, 1 }, { 2, 2, 1 }, { 2, 1, 1, 1},
+         { 1, 1, 1, 1, 1},
+  { 6 }, { 5, 1}, { 4, 2 }, { 4, 1, 1 }, { 3, 3 }, { 3, 2, 1 }, { 3, 1, 1, 1},
+         { 2, 2, 2 }, { 2, 2, 1, 1 }, { 2, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1}
+};
+
+static int8_t next_partition[30][8];
+static uint8_t transition_id[30][8];
+
+uint64_t reflection_size[30];
+
+// Per transition, one case per number of 2-orbits filled.
+struct TransitionCase {
+  uint8_t d;
+  uint8_t rem;
+  uint64_t diag_tail;
+  uint64_t diag_block;
+  uint64_t broken_tail;
+  uint64_t per_full_block;
+  uint64_t prefix;
+};
+
+// There are 201 valid cases.
+static struct TransitionCase transition_cases[45][12][4];
+
+INLINE Bitboard flip_main_diag(Bitboard b)
+{
+  Bitboard t;
+
+  t  = (b ^ (b << 28)) & UINT64_C(0x0f0f0f0f00000000);
+  b ^= t ^ (t >> 28);
+
+  t  = (b ^ (b << 14)) & UINT64_C(0x3333000033330000);
+  b ^= t ^ (t >> 14);
+
+  t  = (b ^ (b << 7)) & UINT64_C(0x5500550055005500);
+  b ^= t ^ (t >> 7);
+
+  return b;
+}
+
+INLINE uint64_t binom(int n, int k)
+{
+  return (k < 0 || k > n) ? 0 : Binomial[k][n];
+}
+
+// Fold (p,s) into the range 0...11.
+// p = number of empty 2-orbits, s = number of empty 1-orbits.
+INLINE int fold_ps(int p, int s)
+{
+  int used_p = 28 - p, used_s = 6 - s;
+  return used_p * 7 - used_p * used_p + used_s;
+}
+
+static uint8_t unfold_ps[12][2];
+
+static int find_partition(int len, uint8_t mult[])
+{
+  uint8_t m[6] = { 0 };
+
+  for (int i = 0; i < len; i++)
+    m[i] = mult[i];
+
+  for (int i = 0; i < len; i++)
+    for (int j = i + 1; j < len; j++)
+      if (m[i] < m[j])
+        Swap(m[i], m[j]);
+
+  for (int i = 0; i < 30; i++)
+    if (memcmp(m, partition[i], 6) == 0)
+      return i;
+
+  abort();
+}
+
+static uint64_t count_broken_residual_cases(int m, int p, int s, int d)
+{
+  int rem = m - 2 * d;
+  int one_min = max(1, rem - s);
+  int one_max = min(p - d, rem);
+  uint64_t total = 0;
+  for (int one = one_min; one <= one_max; one++) {
+    int f = rem - one;
+    total += (binom(p - d, one) * binom(s, f)) << (one - 1);
+  }
+  return total;
+}
+
+static uint64_t count_trivial_part(int part_id, int free)
+{
+  const uint8_t *mult = partition[part_id];
+  uint64_t r = 1;
+  for (int i = 0; mult[i]; i++) {
+    int m = mult[i];
+    r *= binom(free, m);
+    free -= m;
+  }
+  return r;
+}
+
+static void init_perfect_ranker(void)
+{
+  int id = 0;
+  for (int used_p = 0; 2 * used_p <= 5; used_p++)
+    for (int used_s = 0; 2 * used_p + used_s <= 5; used_s++) {
+      unfold_ps[id][0] = 28 - used_p;
+      unfold_ps[id][1] = 6 - used_s;
+      id++;
+    }
+
+  memset(next_partition, -1, sizeof next_partition);
+
+  uint8_t mult[7];
+  for (int p = 0; p < 30; p++) {
+    int m = 0;
+    for (int i = 0; partition[p][i]; i++) {
+      if (partition[p][i] == m)
+        continue;
+      m = partition[p][i];
+      int k = 0;
+      for (int j = 0; partition[p][j]; j++)
+        if (j != i)
+          mult[k++] = partition[p][j];
+      next_partition[p][m] = find_partition(k, mult);
+    }
+  }
+
+  uint64_t count[30][4][7] = { 0 };
+
+  for (int p = 25; p <= 28; p++)
+    for (int s = 0; s <= 6; s++)
+      count[0][p - 25][s] = 1;
+
+  for (int id = 1; id < 30; id++) {
+    const uint8_t *part = partition[id];
+    int m = part[0];
+    int next_part = next_partition[id][m];
+    for (int p = 25; p <= 28; p++)
+      for (int s = 0; s <= 6; s++) {
+        uint64_t total = 0;
+        for (int d = 0; d <= min(p, m / 2); d++) {
+          int rem = m - 2 * d;
+          uint64_t per_full = 0;
+          if (rem <= s)
+            per_full += binom(s, rem) * count[next_part][p - d - 25][s - rem];
+          uint64_t broken_cases = count_broken_residual_cases(m, p, s, d);
+          if (broken_cases != 0)
+            per_full += broken_cases * count_trivial_part(next_part,
+                2 * p + s - m);
+          total += binom(p, d) * per_full;
+        }
+        count[id][p - 25][s] = total;
+      }
+    reflection_size[id] = count[id][28 - 25][6];
+  }
+
+  id = 0;
+  for (int part_id = 1; part_id < 30; part_id++) {
+    for (int m = 1; m <= TB_SETS; m++) {
+      int next_part = next_partition[part_id][m];
+      if (next_part < 0)
+        continue;
+      for (int ps = 0; ps < 12; ps++) {
+        int p = unfold_ps[ps][0];
+        int s = unfold_ps[ps][1];
+        uint64_t prefix = 0;
+        for (int d = 0; d <= min(p, m / 2); d++) {
+          int rem = m - 2 * d;
+          uint64_t diag_tail = 0;
+          uint64_t diag_block = 0;
+          if (rem <= s) {
+            diag_tail = count[next_part][p - d - 25][s - rem];
+            diag_block = binom(s, rem) * diag_tail;
+          }
+          uint64_t broken_cases = count_broken_residual_cases(m, p, s, d);
+          uint64_t broken_tail =
+            broken_cases == 0 ? 0 : count_trivial_part(next_part, 2 * p + s - m);
+          uint64_t per_full = diag_block + broken_cases * broken_tail;
+          uint64_t block = binom(p, d) * per_full;
+          transition_cases[id][ps][d] = (struct TransitionCase) {
+            .d = d,
+            .rem = rem,
+            .diag_tail = diag_tail,
+            .diag_block = diag_block,
+            .broken_tail = broken_tail,
+            .per_full_block = per_full,
+            .prefix = prefix
+          };
+          prefix += block;
+        }
+      }
+      transition_id[part_id][m] = id++;
+    }
+  }
+}
+
+static uint64_t rank_combination(Bitboard subset, Bitboard universe)
+{
+  uint64_t dense = _pext_u64(subset, universe);
+
+  uint64_t r = 0;
+  for (int j = 1; dense; j++)
+    r += Binomial[j][pop_lsb(&dense)];
+  return r;
+}
+
+static uint64_t rank_trivial_from(uint8_t *restrict sq, int k, Bitboard occ,
+    int numsets, const struct TbTable2 *table)
+{
+  uint64_t idx = 0;
+  for (; k < numsets; k++) {
+    size_t s;
+    int i = table->first[k];
+    int m = table->mult[k];
+    if (m == 1) {
+      s = rank_among_free(sq[i], occ);
+      occ |= bit(sq[i]);
+    } else if (m == 2) {
+      Bitboard b = ~occ;
+      Bitboard b1 = bit(sq[i]) | bit(sq[i + 1]);
+      occ |= b1;
+      b1 = _pext_u64(b1, b);
+      s = pop_lsb(&b1);
+      s += Binomial[2][lsb(b1)];
+    } else {
+      Bitboard b = ~occ, b1 = 0;
+      for (int j = 0; j < m; j++)
+        b1 |= bit(sq[i + j]);
+      occ |= b1;
+      b1 = _pext_u64(b1, b);
+      s = 0;
+      for (int j = 1; b1; j++)
+        s += Binomial[j][pop_lsb(&b1)];
+    }
+    idx = idx * table->factor[k] + s;
+  }
+  return idx;
+}
+
+INLINE uint64_t count_broken_residual_before(int rem, int p, int s, int one)
+{
+  uint64_t total = 0;
+  int one_min = max(1, rem - s);
+  for (int oo = one_min; oo < one; oo++) {
+    int f = rem - oo;
+    total += binom(p, oo) * binom(s, f) * (1ull << (oo - 1));
+  }
+  return total;
+}
+
+#define LOWER_DIAG_MASK UINT64_C(0x0080c0e0f0f8fcfe)
+#define MAIN_DIAG_MASK  UINT64_C(0x8040201008040201)
+
+static uint64_t rank_reflection(uint8_t *restrict sq, Bitboard occ,
+    int numsets, const struct TbTable2 *table)
+{
+  int part_id = table->part_id;
+  Bitboard pair_mask = LOWER_DIAG_MASK;
+  Bitboard diag_mask = MAIN_DIAG_MASK & ~occ;
+  int p = 28, s = 6;
+
+  uint64_t rank = 0;
+  for (int k = 0; k < numsets; k++) {
+    int m = table->mult[k];
+    Bitboard bb = 0;
+    for (int i = 0; i < m; i++)
+      bb |= bit(sq[table->first[k] + i]);
+    occ |= bb;
+    int tid = transition_id[part_id][m];
+
+    Bitboard mirror = flip_main_diag(bb);
+    Bitboard full_mask = bb & mirror & pair_mask;
+    Bitboard one_mask = (bb ^ mirror) & pair_mask;
+    int d = popcnt(full_mask);    // Number of 2-orbits fully filled.
+
+    const struct TransitionCase *c = &transition_cases[tid][fold_ps(p, s)][d];
+
+    rank += c->prefix;
+    rank += rank_combination(full_mask, pair_mask) * c->per_full_block;
+    pair_mask &= ~full_mask;
+    p -= d;
+
+    if (!one_mask) {
+      rank += rank_combination(bb, diag_mask) * c->diag_tail;
+      diag_mask &= ~bb;
+      s = popcnt(diag_mask);
+      part_id = next_partition[part_id][m];
+      continue;
+    }
+
+    int one = popcnt(one_mask);     // Number of 2-orbits half filled.
+    int f = popcnt(bb & diag_mask); // Number of 1-orbits filled.
+    rank += c->diag_block;
+    uint64_t r = count_broken_residual_before(c->rem, p, s, one);
+
+    uint64_t rone = rank_combination(one_mask, pair_mask);
+    r += (rone * binom(s, f) + rank_combination(bb, diag_mask)) << (one - 1);
+    rank += r * c->broken_tail;
+
+    // Canonical orientation: orient_mask <= bitwise complement within oo bits.
+    uint32_t orient_mask = _pext_u64(bb, one_mask);
+    uint32_t mask = (1u << one) - 1u;
+    uint32_t comp = (~orient_mask) & mask;
+    uint32_t canon = orient_mask < comp ? orient_mask : comp;
+    // Among 2^oo orientations paired with complements, canonical ones are
+    // exactly 0 .. 2^(oo-1)-1 after min(x,~x) for this ordering.
+    assert(canon < (1u << (one - 1)));
+    rank += canon * c->broken_tail;
+
+    if (comp < orient_mask) {
+      for (int i = 2; i < TB_PIECES; i++)
+        sq[i] = FlipDiag[sq[i]];
+      bb = flip_main_diag(bb);
+    }
+    return rank + rank_trivial_from(sq, k + 1, occ | bb, numsets, table);
+  }
+  return rank;
+}
+
 static void init_indices(void)
 {
   int i, j;
@@ -1096,6 +1462,8 @@ static void init_indices(void)
       Off10[i][j] = n++;
     }
   }
+
+  init_perfect_ranker();
 }
 
 INLINE int leading_pawn(uint8_t *restrict p, struct TbEntry *entry,
@@ -1114,11 +1482,6 @@ INLINE void sort_squares(int n, uint8_t *restrict sq)
     for (int j = i + 1; j < n; j++)
       if (sq[i] > sq[j])
         Swap(sq[i], sq[j]);
-}
-
-INLINE int rank_among_free(uint8_t sq, uint64_t occ)
-{
-  return sq - popcount(occ & ((1ULL << sq) - 1));
 }
 
 INLINE size_t encode(uint8_t *restrict p, struct EncInfo *ei,
@@ -1619,22 +1982,28 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
     }
 
     // Check version.
-    if (data[4] != 1)
+    int version = data[4];
+    if (version > 2)
       return NULL;
 
     const uint8_t *p = data + 4 + entry->num;
     int layout = *p++;
+    if (version == 1)
+      layout = layout_v1[layout];
+    else
+      layout = layout_v2[layout];
     int distFormat;
-    if (type != WDL && layout <= LT_PIECE_KK)
+    if (type != WDL && layout <= LT_PIECE_KK2)
       distFormat = *p++;
-    int num =  layout == LT_PIECE_K  ? 10
-             : layout == LT_PIECE_KK ? 462
-             : layout == LT_PAWN_P   ? 24
-             : layout == LT_PAWN_PK  ? 1512
-             : layout == LT_PAWN_PP  ? 576 : 1128;
+    int num =  layout == LT_PIECE_K   ? 10
+             : layout == LT_PIECE_KK  ? 462
+             : layout == LT_PIECE_KK2 ? 462
+             : layout == LT_PAWN_P    ? 24
+             : layout == LT_PAWN_PK   ? 1512
+             : layout == LT_PAWN_PP   ? 576 : 1128;
     p = (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7);
     if (!entry->symmetric) {
-      if (type != WDL && layout <= LT_PIECE_KK)
+      if (type != WDL && layout <= LT_PIECE_KK2)
         num *= (distFormat & TWO_SIDED) ? 2 : 1;
       else
         num *= 2;
@@ -1644,7 +2013,7 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
     tbase->data = data;
     tbase->mapping = mapping;
     tbase->layout = layout;
-    if (type != WDL && layout <= LT_PIECE_KK)
+    if (type != WDL && layout <= LT_PIECE_KK2)
       tbase->distFormat = distFormat;
     tbase->offset = (uint64_t *)p - (uint64_t *)data;
     tbase->pt[0] = 6;
@@ -1706,7 +2075,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
 
   static const uint8_t knum[] = { 58, 58, 58, 55, 55, 55, 33, 30, 30, 30 };
   uint64_t tb_size = 1;
-  if (tb->layout == LT_PIECE_KK) {
+  if (tb->layout == LT_PIECE_KK || tb->layout == LT_PIECE_KK2) {
     for (int i = 0, n = 62; i < k; i++) {
       table->first[i] = first[data[i]];
       int m = mult[data[i]];
@@ -1715,6 +2084,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
       tb_size *= table->factor[i];
       n -= m;
     }
+    table->part_id = find_partition(k, mult);
     data += k;
   }
   else if (tb->layout == LT_PIECE_K) {
@@ -1980,7 +2350,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     UNLOCK(mutex);
   }
 
-  if (   (type == DTM || (type == DTZ && tb->layout <= LT_PIECE_KK))
+  if (   (type == DTM || (type == DTZ && tb->layout <= LT_PIECE_KK2))
       && (tb->distFormat & WIN_OR_LOSS)
       && (bool)(tb->distFormat & WIN_ONLY) != (s > 0))
   {
@@ -2069,7 +2439,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
 
   } else { /* PIECE_K || PIECE_KK || PAWN_P || PAWN_PK || PAWN_PvP || PAWN_PP */
 
-    if (   (type == DTM || (type == DTZ && tb->layout <= LT_PIECE_KK))
+    if (   (type == DTM || (type == DTZ && tb->layout <= LT_PIECE_KK2))
         && (tb->distFormat & WTM_OR_BTM)
         && (bool)(tb->distFormat & WTM_ONLY) == btm_side)
     {
@@ -2083,7 +2453,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     int t, tsq;
     uint64_t idx = 0;
     Bitboard occ;
-    if (tb->layout <= LT_PIECE_KK) {
+    if (tb->layout <= LT_PIECE_KK2) {
 
       if (tb->layout == LT_PIECE_K && btm_side)
         Swap(p[0], p[1]);
@@ -2170,25 +2540,29 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
       }
     }
 
-    // Calculate index.
-    static const int extra[] = { 1, 0, 2, 1, 0, 0 };
-    int numsets =  entry->numsets + extra[tb->layout - LT_PIECE_K];
-    for (int k = 0; k < numsets; k++) {
-      size_t s = 0;
-      if (table->mult[k] == 0)
-        s = Off10[tsq][p[1]];
-      else {
-        int m = table->first[k];
-        sort_squares(table->mult[k], &p[m]);
-        Bitboard occ2 = occ;
-        for (int i = 0; i < table->mult[k]; i++, m++) {
-          int rank = rank_among_free(p[m], occ);
-          occ2 |= bit(p[m]);
-          s += Binomial[i + 1][rank];
+    if (tb->layout != LT_PIECE_KK2 || tsq < 441) {
+      // Calculate index.
+      static const int extra[] = { 1, 0, 0, 2, 1, 0, 0 };
+      int numsets =  entry->numsets + extra[tb->layout - LT_PIECE_K];
+      for (int k = 0; k < numsets; k++) {
+        size_t s = 0;
+        if (table->mult[k] == 0)
+          s = Off10[tsq][p[1]];
+        else {
+          int m = table->first[k];
+          sort_squares(table->mult[k], &p[m]);
+          Bitboard occ2 = occ;
+          for (int i = 0; i < table->mult[k]; i++, m++) {
+            int rank = rank_among_free(p[m], occ);
+            occ2 |= bit(p[m]);
+            s += Binomial[i + 1][rank];
+          }
+          occ = occ2;
         }
-        occ = occ2;
+        idx = idx * table->factor[k] + s;
       }
-      idx = idx * table->factor[k] + s;
+    } else {
+      idx = rank_reflection(p, occ, entry->numsets, table);
     }
 
     TB_ProbeCount[type]++;
