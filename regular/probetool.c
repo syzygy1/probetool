@@ -53,7 +53,7 @@ void print_pv_dtz(TB_Position *pos)
   int pv[2000], k = 0;
   bool success;
 
-  printf("\nDTZ50-optimal mating line:\n[FEN \"%s\"]\n", fen);
+  printf("\n[Event \"DTZ50-optimal mating line\"]\n[FEN \"%s\"]\n", fen);
   col = 0;
   TB_ProbeCount[TB_WDL] = TB_ProbeCount[TB_DTZ] = 0;
 
