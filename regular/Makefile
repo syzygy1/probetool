@@ -1,7 +1,7 @@
 CC = gcc
 #CC = x86_64-w64-mingw32-gcc
-CFLAGS = -O3 -std=c11 -march=native -Wall -Wextra -pedantic -DNDEBUG
-#CFLAGS = -g3 -std=c11 -march=native -Wall -Wextra -pedantic
+#CFLAGS = -O3 -std=c11 -march=native -Wall -Wextra -pedantic -DNDEBUG
+CFLAGS = -g3 -std=c11 -march=native -Wall -Wextra -pedantic
 
 # Make a choice between bitboard-based move generation and 0x88-based move generation.
 TBINTERFACE = tbinterface_bb

@@ -420,7 +420,7 @@ uint64_t TB_ProbeCount[3];
 
 static const char *suffix[] = { ".rtbw", ".rtbm", ".rtbz" };
 static uint32_t magic[] = { 0x5d23e871, 0x88ac504b, 0xa50c66d7 };
-static uint32_t magic2[] = { 0x9ca55208, 0xd895e4a4, 0xeaf9b743 };
+static uint32_t magic2[] = { 0xe5c0db4d, 0x97ad8bad, 0x432c57d6 };
 
 enum { STARTBITS = 8 };
 
@@ -1972,7 +1972,7 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
 
     // Check version.
     int version = data[4];
-    if (version > 2)
+    if (version > 1)
       return NULL;
 
     const uint8_t *p = data + 4 + entry->num;
@@ -2069,7 +2069,7 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
       tb_size *= table->factor[i];
       n -= m;
     }
-    if (tb->layout == LT_PIECE_KK && tsq >= 441 && tb->version >= 2) {
+    if (tb->layout == LT_PIECE_KK && tsq >= 441) {
       table->part_id = find_partition(k, mult);
       tb_size = reflection_size[table->part_id];
     }
@@ -2529,7 +2529,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     }
 
     // Calculate index.
-    if (tb->layout != LT_PIECE_KK || tsq < 441 || tb->version == 1) {
+    if (tb->layout != LT_PIECE_KK || tsq < 441) {
       static const int extra[] = { 1, 0, 2, 1, 0, 0 };
       int numsets =  entry->numsets + extra[tb->layout - LT_PIECE_K];
       for (int k = 0; k < numsets; k++) {
