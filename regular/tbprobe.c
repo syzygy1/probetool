@@ -449,10 +449,6 @@ struct PairsData {
   uint64_t base[]; // must be base[1] in C++
 };
 
-// TODO: Instead of including indexing info in each TbTable2 struct,
-// use an identifier that identifies a precomputed index struct.
-// Perhaps also for TbTable structs.
-
 struct EncInfo {
   size_t factor[TB_PIECES];
   uint8_t pieces[TB_PIECES];
@@ -488,28 +484,52 @@ struct DtzTable {
   uint8_t dtzFlags;
 };
 
+struct RankInfo {
+  uint8_t numsets;
+//  uint8_t first[TB_SETS];
+  uint8_t mult[TB_SETS];
+  uint8_t transition_id[TB_SETS];
+  uint32_t factor[TB_SETS];
+  uint64_t sizes[2];
+};
+
+struct RankInfo10 {
+  uint8_t numsets;
+  uint8_t k2;                 // Set index of the non-leading king.
+//  uint8_t first[TB_SETS];
+  uint8_t mult[TB_SETS];
+  uint32_t factor[TB_SETS];
+};
+
+static struct RankInfo rank_info_61[32];
+static struct RankInfo rank_info_62[64];
+static struct RankInfo rank_info_63[64];
+
 struct TbTable2 {
   struct PairsData *precomp;
-  uint32_t factor[TB_SETS];
+  union {
+    const struct RankInfo *ri;
+    const struct RankInfo10 *ri_10;
+  };
   uint8_t first[TB_SETS];
-  uint8_t mult[TB_SETS];
-  uint8_t part_id;
 };
 
 struct WdlTable2 {
   struct PairsData *precomp;
-  uint32_t factor[TB_SETS];
+  union {
+    const struct RankInfo *ri;
+    const struct RankInfo10 *ri_10;
+  };
   uint8_t first[TB_SETS];
-  uint8_t mult[TB_SETS];
-  uint8_t part_id;
 };
 
 struct DtmTable2 {
   struct PairsData *precomp;
-  uint32_t factor[TB_SETS];
+  union {
+    const struct RankInfo *ri;
+    const struct RankInfo10 *ri_10;
+  };
   uint8_t first[TB_SETS];
-  uint8_t mult[TB_SETS];
-  uint8_t part_id;
   uint8_t mapped;
   uint8_t distFormat;
   uint16_t dtmMapIdx[2];
@@ -518,10 +538,11 @@ struct DtmTable2 {
 
 struct DtzTable2 {
   struct PairsData *precomp;
-  uint32_t factor[TB_SETS];
+  union {
+    const struct RankInfo *ri;
+    const struct RankInfo10 *ri_10;
+  };
   uint8_t first[TB_SETS];
-  uint8_t mult[TB_SETS];
-  uint8_t part_id;
   uint8_t mapped;
   uint8_t distFormat;
   uint16_t dtzMapIdx[4];
@@ -1077,9 +1098,6 @@ static const uint8_t partition[30][7] = {
          { 2, 2, 2 }, { 2, 2, 1, 1 }, { 2, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1}
 };
 
-static int8_t next_partition[30][8];
-static uint8_t transition_id[30][8];
-
 uint64_t reflection_size[30];
 
 // Per transition, one case per number of 2-orbits filled.
@@ -1110,6 +1128,29 @@ INLINE Bitboard flip_main_diag(Bitboard b)
   b ^= t ^ (t >> 7);
 
   return b;
+}
+
+static void unrank_mult(int idx, uint8_t mult[TB_SETS])
+{
+  int k = 0;
+  uint32_t b = idx;
+  while (b) {
+    int s = lsb(b) + 1;
+    b >>= s;
+    mult[k++] = s;
+  }
+  while (k < TB_SETS)
+    mult[k++] = 0;
+}
+
+int rank_mult(uint8_t mult[TB_SETS])
+{
+  int idx = 0, s = 0;
+  for (int k = 0; k < TB_SETS && mult[k]; k++) {
+    s += mult[k];
+    idx |= bit(s - 1);
+  }
+  return idx;
 }
 
 INLINE uint64_t binom(int n, int k)
@@ -1171,6 +1212,17 @@ static uint64_t count_trivial_part(int part_id, int free)
   return r;
 }
 
+static void calc_factors(struct RankInfo *ri, int n)
+{
+  uint64_t f = 1;
+  for (int i = 0; i < ri->numsets; i++) {
+    ri->factor[i] = Binomial[ri->mult[i]][n];
+    f *= ri->factor[i];
+    n -= ri->mult[i];
+  }
+  ri->sizes[0] = f;
+}
+
 static void init_perfect_ranker(void)
 {
   int id = 0;
@@ -1181,6 +1233,7 @@ static void init_perfect_ranker(void)
       id++;
     }
 
+  int8_t next_partition[30][7];
   memset(next_partition, -1, sizeof next_partition);
 
   uint8_t mult[7];
@@ -1211,7 +1264,7 @@ static void init_perfect_ranker(void)
     for (int p = 25; p <= 28; p++)
       for (int s = 0; s <= 6; s++) {
         uint64_t total = 0;
-        for (int d = 0; d <= min(p, m / 2); d++) {
+        for (int d = 0; d <= min(p - 25, m / 2); d++) {
           int rem = m - 2 * d;
           uint64_t per_full = 0;
           if (rem <= s)
@@ -1224,8 +1277,9 @@ static void init_perfect_ranker(void)
         }
         count[id][p - 25][s] = total;
       }
-    reflection_size[id] = count[id][28 - 25][6];
   }
+
+  uint8_t transition_id[30][8] = { 0 };
 
   id = 0;
   for (int part_id = 1; part_id < 30; part_id++) {
@@ -1237,7 +1291,7 @@ static void init_perfect_ranker(void)
         int p = unfold_ps[ps][0];
         int s = unfold_ps[ps][1];
         uint64_t prefix = 0;
-        for (int d = 0; d <= min(p, m / 2); d++) {
+        for (int d = 0; d <= min(p - 25, m / 2); d++) {
           int rem = m - 2 * d;
           uint64_t diag_tail = 0;
           uint64_t diag_block = 0;
@@ -1265,6 +1319,47 @@ static void init_perfect_ranker(void)
       transition_id[part_id][m] = id++;
     }
   }
+
+  // Initialize RankInfo[] structs.
+
+  for (int id = 0; id < 64; id++) {
+    struct RankInfo *ri = &rank_info_62[id];
+    uint8_t *m = ri->mult;
+    unrank_mult(id, m);
+    int n = 0;
+    while (n < TB_PIECES && m[n])
+      n++;
+    ri->numsets = n;
+    int part_id = find_partition(n, m);
+    for (int k = 0, p = part_id; k < n; k++) {
+      ri->transition_id[k] = transition_id[p][m[k]];
+      p = next_partition[p][m[k]];
+    }
+    calc_factors(ri, 62);
+    ri->sizes[1] = count[part_id][28 - 25][6];
+  }
+
+  for (int id = 0; id < 32; id++) {
+    struct RankInfo *ri = &rank_info_61[id];
+    uint8_t *m = ri->mult;
+    unrank_mult(id, m);
+    int n = 0;
+    while (n < TB_PIECES && m[n])
+      n++;
+    ri->numsets = n;
+    calc_factors(ri, 61);
+  }
+
+  for (int id = 0; id < 64; id++) {
+    struct RankInfo *ri = &rank_info_63[id];
+    uint8_t *m = ri->mult;
+    unrank_mult(id, m);
+    int n = 0;
+    while (n < TB_PIECES && m[n])
+      n++;
+    ri->numsets = n;
+    calc_factors(ri, 63);
+  }
 }
 
 static uint64_t rank_combination(Bitboard subset, Bitboard universe)
@@ -1278,13 +1373,13 @@ static uint64_t rank_combination(Bitboard subset, Bitboard universe)
 }
 
 static uint64_t rank_trivial_from(uint8_t *restrict sq, int k, Bitboard occ,
-    int numsets, const struct TbTable2 *table)
+    const uint8_t *restrict first, const struct RankInfo *ri)
 {
   uint64_t idx = 0;
-  for (; k < numsets; k++) {
+  for (; k < ri->numsets; k++) {
     size_t s;
-    int i = table->first[k];
-    int m = table->mult[k];
+    int i = first[k];
+    int m = ri->mult[k];
     if (m == 1) {
       s = rank_among_free(sq[i], occ);
       occ |= bit(sq[i]);
@@ -1305,7 +1400,7 @@ static uint64_t rank_trivial_from(uint8_t *restrict sq, int k, Bitboard occ,
       for (int j = 1; b1; j++)
         s += Binomial[j][pop_lsb(&b1)];
     }
-    idx = idx * table->factor[k] + s;
+    idx = idx * ri->factor[k] + s;
   }
   return idx;
 }
@@ -1325,21 +1420,20 @@ INLINE uint64_t count_broken_residual_before(int rem, int p, int s, int one)
 #define MAIN_DIAG_MASK  UINT64_C(0x8040201008040201)
 
 static uint64_t rank_reflection(uint8_t *restrict sq, Bitboard occ,
-    int numsets, const struct TbTable2 *table)
+    const uint8_t *restrict first, const struct RankInfo *ri)
 {
-  int part_id = table->part_id;
   Bitboard pair_mask = LOWER_DIAG_MASK;
   Bitboard diag_mask = MAIN_DIAG_MASK & ~occ;
   int p = 28, s = 6;
 
   uint64_t rank = 0;
-  for (int k = 0; k < numsets; k++) {
-    int m = table->mult[k];
+  for (int k = 0; k < ri->numsets; k++) {
+    int m = ri->mult[k];
     Bitboard bb = 0;
     for (int i = 0; i < m; i++)
-      bb |= bit(sq[table->first[k] + i]);
+      bb |= bit(sq[first[k] + i]);
     occ |= bb;
-    int tid = transition_id[part_id][m];
+    int tid = ri->transition_id[k];
 
     Bitboard mirror = flip_main_diag(bb);
     Bitboard full_mask = bb & mirror & pair_mask;
@@ -1353,39 +1447,37 @@ static uint64_t rank_reflection(uint8_t *restrict sq, Bitboard occ,
     pair_mask &= ~full_mask;
     p -= d;
 
-    if (!one_mask) {
-      rank += rank_combination(bb, diag_mask) * c->diag_tail;
-      diag_mask &= ~bb;
-      s = popcnt(diag_mask);
-      part_id = next_partition[part_id][m];
-      continue;
+    if (one_mask) {
+      int one = popcnt(one_mask);     // Number of 2-orbits half filled.
+      int f = popcnt(bb & diag_mask); // Number of 1-orbits filled.
+      rank += c->diag_block;
+      uint64_t r = count_broken_residual_before(c->rem, p, s, one);
+
+      uint64_t rone = rank_combination(one_mask, pair_mask);
+      r += (rone * binom(s, f) + rank_combination(bb, diag_mask)) << (one - 1);
+      rank += r * c->broken_tail;
+
+      // Canonical orientation: orient_mask <= bitwise complement within oo bits.
+      uint32_t orient_mask = _pext_u64(bb, one_mask);
+      uint32_t mask = (1u << one) - 1u;
+      uint32_t comp = (~orient_mask) & mask;
+      uint32_t canon = orient_mask < comp ? orient_mask : comp;
+      // Among 2^oo orientations paired with complements, canonical ones are
+      // exactly 0 .. 2^(oo-1)-1 after min(x,~x) for this ordering.
+      assert(canon < (1u << (one - 1)));
+      rank += canon * c->broken_tail;
+
+      if (comp < orient_mask) {
+        for (int i = 2; i < TB_PIECES; i++)
+          sq[i] = FlipDiag[sq[i]];
+        occ = flip_main_diag(occ);
+      }
+      return rank + rank_trivial_from(sq, k + 1, occ, first, ri);
     }
 
-    int one = popcnt(one_mask);     // Number of 2-orbits half filled.
-    int f = popcnt(bb & diag_mask); // Number of 1-orbits filled.
-    rank += c->diag_block;
-    uint64_t r = count_broken_residual_before(c->rem, p, s, one);
-
-    uint64_t rone = rank_combination(one_mask, pair_mask);
-    r += (rone * binom(s, f) + rank_combination(bb, diag_mask)) << (one - 1);
-    rank += r * c->broken_tail;
-
-    // Canonical orientation: orient_mask <= bitwise complement within oo bits.
-    uint32_t orient_mask = _pext_u64(bb, one_mask);
-    uint32_t mask = (1u << one) - 1u;
-    uint32_t comp = (~orient_mask) & mask;
-    uint32_t canon = orient_mask < comp ? orient_mask : comp;
-    // Among 2^oo orientations paired with complements, canonical ones are
-    // exactly 0 .. 2^(oo-1)-1 after min(x,~x) for this ordering.
-    assert(canon < (1u << (one - 1)));
-    rank += canon * c->broken_tail;
-
-    if (comp < orient_mask) {
-      for (int i = 2; i < TB_PIECES; i++)
-        sq[i] = FlipDiag[sq[i]];
-      occ = flip_main_diag(occ);
-    }
-    return rank + rank_trivial_from(sq, k + 1, occ, numsets, table);
+    rank += rank_combination(bb, diag_mask) * c->diag_tail;
+    diag_mask &= ~bb;
+    s = popcnt(diag_mask);
   }
   return rank;
 }
@@ -2017,8 +2109,8 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
   return NULL;
 }
 
-static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
-    struct Tbase *tb, int type, int tidx, int tsq)
+static NOINLINE struct TbTable2 *init_new_table(struct Tbase *tb, int num,
+    int type, int tidx, int tsq)
 {
   const uint64_t *offsets = (uint64_t *)tb->data + tb->offset;
   if (offsets[tidx] == 0)
@@ -2044,83 +2136,69 @@ static NOINLINE struct TbTable2 *init_new_table(struct TbEntry *entry,
     distFormat = tb->layout >= LT_PAWN_P ? *data++ : 0;
   }
 
-  uint8_t first[TB_SETS];
-  uint8_t mult[TB_SETS];
+  uint8_t first[TB_SETS], mult[TB_SETS] = { 0 };
   int k = 0;
-  for (int i = 2, l = 0; i < entry->num; i++) {
-    if (tb->pt[i] != l) {
-      l = tb->pt[i];
+  for (int i = 2; i < num; i++) {
+    if (i == 2 || tb->pt[i] != tb->pt[i - 1]) {
       first[k] = i;
-      mult[k] = 0;
-      k++;
+      mult[k++] = 0;
     }
-    if (k > 0)
-      mult[k - 1]++;
+    mult[k - 1]++;
   }
 
   static const uint8_t knum[] = { 58, 58, 58, 55, 55, 55, 33, 30, 30, 30 };
   uint64_t tb_size = 1;
-  if (tb->layout == LT_PIECE_KK || tb->layout == LT_PIECE_KK) {
-    for (int i = 0, n = 62; i < k; i++) {
+  if (tb->layout == LT_PIECE_KK) {
+    uint8_t m[TB_SETS] = { 0 };
+    for (int i = 0; i < k; i++) {
       table->first[i] = first[data[i]];
-      int m = mult[data[i]];
-      table->mult[i] = m;
-      table->factor[i] = Binomial[m][n];
-      tb_size *= table->factor[i];
-      n -= m;
+      m[i] = mult[data[i]];
     }
-    if (tb->layout == LT_PIECE_KK && tsq >= 441) {
-      table->part_id = find_partition(k, mult);
-      tb_size = reflection_size[table->part_id];
-    }
+    table->ri = &rank_info_62[rank_mult(m)];
+    tb_size = table->ri->sizes[tsq >= 441];
     data += k;
   }
   else if (tb->layout == LT_PIECE_K) {
+    // For now we'll just alloc rather than precompute it.
+    struct RankInfo10 *ri10 = malloc(sizeof *ri10);
+    tb_size = 1;
+    ri10->numsets = k + 1;
     for (int i = 0, n = 62; i < k + 1; i++) {
       if (data[i] == 0) {
-        table->first[i] = table->mult[i] = 0;
-        table->factor[i] = knum[tsq];
+        table->first[i] = ri10->mult[i] = 0;
+        ri10->factor[i] = knum[tsq];
       } else {
         table->first[i] = first[data[i] - 1];
         int m = mult[data[i] - 1];
-        table->mult[i] = m;
-        table->factor[i] = Binomial[m][n];
+        ri10->mult[i] = m;
+        ri10->factor[i] = Binomial[m][n];
         n -= m;
       }
-      tb_size *= table->factor[i];
+      tb_size *= ri10->factor[i];
     }
+    table->ri_10 = ri10;
     data += k + 1;
   }
   else if (tb->layout == LT_PAWN_P) {
-    for (int i = 0, n = 63; i < k + 1; i++) {
-      int l = data[i];
-      if (l < 2) {
-        table->first[i] = l;
-        table->mult[i] = 1;
-      } else {
-        table->first[i] = first[l - 1];
-        table->mult[i] = mult[l - 1];
-      }
-      table->factor[i] = Binomial[table->mult[i]][n];
-      n -= table->mult[i];
-      tb_size *= table->factor[i];
+    assert(k + 2 <= TB_SETS);
+    uint8_t m[TB_SETS];
+    for (int i = 0; i < k + 1; i++) {
+      table->first[i] = data[i] < 2 ? data[i] : first[data[i] - 1];
+      m[i] = data[i] < 2 ? 1 : mult[data[i] - 1];
     }
+    table->ri = &rank_info_63[rank_mult(m)];
+    tb_size = table->ri->sizes[0];
     data += k + 1;
   }
   else if (tb->layout == LT_PAWN_PK) {
-    for (int i = 0, n = 62; i < k; i++) {
-      int l = data[i];
-      if (l == 0) {
-        table->first[i] = 1;
-        table->mult[i] = 1;
-      } else {
-        table->first[i] = first[l];
-        table->mult[i] = mult[l];
-      }
-      table->factor[i] = Binomial[table->mult[i]][n];
-      n -= table->mult[i];
-      tb_size *= table->factor[i];
+    assert(k + 1 <= TB_SETS);
+    uint8_t m[TB_SETS];
+    for (int i = 0; i < k; i++) {
+      table->first[i] = data[i] == 0 ? 1 : first[data[i]];
+      m[i] = data[i] == 0 ? 1 : mult[data[i]];
     }
+    table->ri = &rank_info_62[rank_mult(m)];
+    tb_size = table->ri->sizes[0];
     data += k;
   }
   data += (uintptr_t)data & 1;
@@ -2491,7 +2569,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
       LOCK(mutex);
       if (!(table = atomic_load_explicit(&tb->table[t], memory_order_relaxed)))
       {
-        table = init_new_table(entry, tb, type, t, tsq);
+        table = init_new_table(tb, entry->num, type, t, tsq);
         atomic_store_explicit(&tb->table[t], table, memory_order_release);
       }
       UNLOCK(mutex);
@@ -2508,8 +2586,7 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
           && tbl->distFormat
           && (bool)(tbl->distFormat & WIN_ONLY) != (s > 0))
         *result = CHANGE_STM;
-      return (int)((struct TbTableConst *)table)->constVal
-        + (type == WDL ? -2 : 0);
+      return (int)tbl->constVal + (type == WDL ? -2 : 0);
     }
 
     if (type == DTM) {
@@ -2529,28 +2606,33 @@ INLINE int probe_table(TB_Position *pos, const int s, int *result,
     }
 
     // Calculate index.
-    if (tb->layout != LT_PIECE_KK || tsq < 441) {
-      static const int extra[] = { 1, 0, 2, 1, 0, 0 };
-      int numsets =  entry->numsets + extra[tb->layout - LT_PIECE_K];
-      for (int k = 0; k < numsets; k++) {
+    if (    tb->layout > LT_PIECE_KK
+        || (tb->layout == LT_PIECE_KK && tsq < 441))
+    {
+      idx = rank_trivial_from(p, 0, occ, table->first, table->ri);
+    }
+    else if (tb->layout == LT_PIECE_KK) {
+      idx = rank_reflection(p, occ, table->first, table->ri);
+    }
+    else if (tb->layout == LT_PIECE_K) {
+      const struct RankInfo10 *ri = table->ri_10;
+      for (int k = 0; k < ri->numsets; k++) {
         size_t s = 0;
-        if (table->mult[k] == 0)
+        if (ri->mult[k] == 0)
           s = Off10[tsq][p[1]];
         else {
           int m = table->first[k];
-          sort_squares(table->mult[k], &p[m]);
+          sort_squares(ri->mult[k], &p[m]);
           Bitboard occ2 = occ;
-          for (int i = 0; i < table->mult[k]; i++, m++) {
+          for (int i = 0; i < ri->mult[k]; i++, m++) {
             int rank = rank_among_free(p[m], occ);
             occ2 |= bit(p[m]);
             s += Binomial[i + 1][rank];
           }
           occ = occ2;
         }
-        idx = idx * table->factor[k] + s;
+        idx = idx * ri->factor[k] + s;
       }
-    } else {
-      idx = rank_reflection(p, occ, entry->numsets, table);
     }
 
     TB_ProbeCount[type]++;
