@@ -420,7 +420,7 @@ uint64_t TB_ProbeCount[3];
 
 static const char *suffix[] = { ".rtbw", ".rtbm", ".rtbz" };
 static uint32_t magic[] = { 0x5d23e871, 0x88ac504b, 0xa50c66d7 };
-static uint32_t magic2[] = { 0xe5c0db4d, 0x97ad8bad, 0x432c57d6 };
+static uint32_t magic2[] = { 0x1cc16da5, 0x97ad8bad, 0x4cf550cf };
 
 enum { STARTBITS = 8 };
 
@@ -2050,24 +2050,28 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
   }
 
   if (read_le_u32(data) == magic2[type]) {
-    if (data[4] == 0) { // May need further changes for DTM.
+    const uint8_t *p = data + 4 + (type == WDL ? 16 : 32);
+    if (p[0] == 0) { // May need further changes for DTM.
       int num = entry->hasPawns ? type == DTM ? 6 : 4 : 1;
-      if (!entry->symmetric && (type == WDL || (data[5] & TWO_SIDED)))
+      if (!entry->symmetric && (type == WDL || (p[1] & TWO_SIDED)))
         num *= 2;
       struct Tbase *tb = calloc(1, sizeof(struct Tbase) + num * sizeof(void *));
       tb->data = data;
       tb->mapping = mapping;
       tb->layout =  !entry->hasPawns ? LT_PIECE
                   : type == DTM ? LT_PAWN_RANK : LT_PAWN_FILE;
-      return init_old_layout(entry, tb, type, data + 4, true);
+      return init_old_layout(entry, tb, type, p, true);
     }
 
     // Check version.
-    int version = data[4];
+    int version = p[0];
     if (version > 1)
       return NULL;
 
-    const uint8_t *p = data + 4 + entry->num;
+    uint8_t tmp[TB_PIECES];
+    for (int i = 2; i < entry->num; i++)
+      tmp[i] = p[i];
+    p += entry->num;
     int layout = *p++;
     int distFormat;
     if (type != WDL && layout <= LT_PIECE_KK)
@@ -2096,7 +2100,7 @@ static NOINLINE struct Tbase *init_tb(struct TbEntry *entry, const char *str,
     tbase->pt[0] = 6;
     tbase->pt[1] = 14;
     for (int i = 2; i < entry->num; i++)
-      tbase->pt[i] = (data[4 + i] & 0x07) | ((data[4 + i] & 0x80) >> 4);
+      tbase->pt[i] = (tmp[i] & 0x07) | ((tmp[i] & 0x80) >> 4);
     int c[16] = { 0 };
     for (int i = 0; i < entry->num; i++)
       c[tbase->pt[i]]++;
